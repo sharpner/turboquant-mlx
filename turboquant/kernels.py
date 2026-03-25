@@ -4,10 +4,7 @@ Strategy: Matmul operations (rotation, centroid lookup) via mx.matmul/mx.take.
 Only bit operations (quantization, sign packing, QJL scoring) as Metal kernels.
 """
 
-import math
-
 import mlx.core as mx
-import mlx.nn as nn
 
 
 # --- Kernel 1: Scalar Quantize (binary search on boundaries) ---
@@ -108,77 +105,7 @@ def pack_sign_bits(values: mx.array) -> mx.array:
     return outputs[0].reshape(out_shape)
 
 
-# --- Kernel 3: QJL Score — Dot product with packed sign bits ---
-
-_QJL_SCORE_HEADER = """
-inline float popcount_xnor(uint32_t a, uint32_t b) {
-    // XNOR: matching bits = 1, differing = 0
-    // popcount(XNOR) = number of matching bits
-    // Score = 2 * matching - total = 2 * popcount(~(a^b)) - 32
-    uint32_t xnor_val = ~(a ^ b);
-    return static_cast<float>(2 * static_cast<int>(popcount(xnor_val)) - 32);
-}
-"""
-
-_QJL_SCORE_SOURCE = """
-    // Grid: (num_queries * num_keys, 1, 1)
-    // Each thread computes the QJL score for one (query, key) pair
-    uint pair_idx = thread_position_in_grid.x;
-    uint num_keys = key_signs_shape[0];
-    uint num_words = key_signs_shape[1];  // D / 32
-
-    uint q_idx = pair_idx / num_keys;
-    uint k_idx = pair_idx % num_keys;
-
-    float score = 0.0f;
-    for (uint w = 0; w < num_words; w++) {
-        // Query sketch is also packed as sign bits
-        uint32_t q_word = query_signs[q_idx * num_words + w];
-        uint32_t k_word = key_signs[k_idx * num_words + w];
-        score += popcount_xnor(q_word, k_word);
-    }
-    scores[pair_idx] = score;
-"""
-
-_qjl_score_kernel = mx.fast.metal_kernel(
-    name="turboquant_qjl_score",
-    input_names=["query_signs", "key_signs"],
-    output_names=["scores"],
-    source=_QJL_SCORE_SOURCE,
-    header=_QJL_SCORE_HEADER,
-)
-
-
-def qjl_score(query_signs: mx.array, key_signs: mx.array) -> mx.array:
-    """Computes QJL inner-product scores between queries and keys.
-
-    Uses XNOR + popcount for efficient 1-bit dot product.
-
-    Args:
-        query_signs: (T_q, D // 32) uint32 — packed query sketch signs
-        key_signs: (T_kv, D // 32) uint32 — packed key residual signs
-
-    Returns:
-        scores: (T_q, T_kv) float32 — the QJL score components
-    """
-    T_q = query_signs.shape[0]
-    T_kv = key_signs.shape[0]
-    total_pairs = T_q * T_kv
-
-    if total_pairs == 0:
-        return mx.zeros((T_q, T_kv))
-
-    outputs = _qjl_score_kernel(
-        inputs=[query_signs, key_signs],
-        grid=(total_pairs, 1, 1),
-        threadgroup=(min(256, total_pairs), 1, 1),
-        output_shapes=[(total_pairs,)],
-        output_dtypes=[mx.float32],
-    )
-    return outputs[0].reshape(T_q, T_kv)
-
-
-# --- Kernel 4: Pack 2-bit Indices in uint32 (16 indices per word) ---
+# --- Kernel 3: Pack 2-bit Indices in uint32 (16 indices per word) ---
 
 _PACK_2BIT_SOURCE = """
     // One thread per uint32 word (packs 16 2-bit indices)
@@ -419,9 +346,11 @@ def qjl_encode(
     return sign_bits, residual_norms
 
 
-# --- Fused Kernel 1: TurboQuant Score (MSE + QJL in one kernel) ---
+# ===========================================================================
+# HIGH-OCCUPANCY FUSED KERNEL — 32 simdgroups, rotation outside
+# ===========================================================================
 
-_FUSED_SCORE_SOURCE = """
+_FUSED_SCORE_SOURCE_DEAD = """
     // Grid: (T_kv, n_repeats, 1) — one thread per (key, repeat) pair
     uint k = thread_position_in_grid.x;
     uint r = thread_position_in_grid.y;
@@ -468,7 +397,7 @@ _fused_score_kernel = mx.fast.metal_kernel(
     input_names=["q_rot", "q_sketch", "key_packed", "centroids",
                  "key_norms", "key_sign_bits", "key_residual_norms", "qjl_scale"],
     output_names=["scores"],
-    source=_FUSED_SCORE_SOURCE,
+    source=_FUSED_SCORE_SOURCE_DEAD,
 )
 
 

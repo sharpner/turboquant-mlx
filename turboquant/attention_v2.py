@@ -2,6 +2,9 @@
 
 Identical to MLX's quantized_scaled_dot_product_attention,
 extended with optional random QR rotation and QJL correction.
+
+QJL uses a fused Metal kernel for sign-bit dot products (T_q=1),
+avoiding the 32x memory blowup from unpacking sign bits to float.
 """
 
 import math
@@ -26,7 +29,7 @@ def turboquant_v2_sdpa(
     n_repeats = n_q_heads // n_kv_heads
     T_kv = cache.offset
 
-    # --- Rotate query (optional) ---
+    # Rotate query (optional)
     q_scaled = queries * scale
     if cache.use_qjl:
         q_combined = q_scaled @ cache.combined_rot_jl.T
@@ -37,7 +40,7 @@ def turboquant_v2_sdpa(
     else:
         q_rot = q_scaled
 
-    # --- GQA: reshape + expand (like MLX's quantized_scaled_dot_product_attention) ---
+    # GQA: reshape + expand
     if n_repeats > 1:
         q_rot = q_rot.reshape(B, n_kv_heads, n_repeats, T_q, D)
     else:
@@ -45,24 +48,24 @@ def turboquant_v2_sdpa(
     q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
     q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
 
-    # --- Scores ---
+    # Scores via native quantized_matmul
     scores = mx.quantized_matmul(
         q_rot, *q_keys,
         transpose=True, group_size=cache.group_size, bits=cache.bits,
     )
 
-    # --- QJL correction (optional) ---
+    # QJL correction (optional)
     if cache.use_qjl and cache.key_sign_bits is not None:
         qjl_scale = math.sqrt(math.pi / 2.0) / D
         if T_q == 1:
-            # Fused Metal kernel: reads packed sign bits directly, avoids 32x memory blowup
+            # Fused Metal kernel: reads packed sign bits directly
             q_sketch_flat = q_sketch.reshape(B * n_kv_heads * n_repeats, D)
             sign_bits_flat = cache.key_sign_bits[:, :, :T_kv, :].reshape(B * n_kv_heads, T_kv, -1)
             norms_flat = cache.key_residual_norms[:, :, :T_kv].reshape(B * n_kv_heads, T_kv)
             qjl_flat = fused_qjl_scores(q_sketch_flat, sign_bits_flat, norms_flat, D, qjl_scale)
             qjl_scores = qjl_flat.reshape(B, n_kv_heads, n_repeats, 1, T_kv)
         else:
-            # Prefill fallback: unpack + matmul (T_q > 1 is rare after prefill)
+            # Prefill fallback: unpack + matmul
             q_sketch_grouped = q_sketch.reshape(B, n_kv_heads, n_repeats, T_q, D)
             k_signs = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
             k_signs_exp = k_signs[:, :, None, :, :]
@@ -70,7 +73,7 @@ def turboquant_v2_sdpa(
             qjl_scores = qjl_scores * qjl_scale * cache.key_residual_norms[:, :, :T_kv][:, :, None, None, :]
         scores = scores + qjl_scores
 
-    # --- Mask (identical to MLX's implementation) ---
+    # Mask
     if mask is not None:
         if isinstance(mask, str):
             qL, kL = scores.shape[-2:]
@@ -82,14 +85,14 @@ def turboquant_v2_sdpa(
         else:
             scores = scores + mask
 
-    # --- Softmax + Value Output ---
+    # Softmax + Value Output
     weights = mx.softmax(scores, axis=-1, precise=True)
     output = mx.quantized_matmul(
         weights, *q_values,
         transpose=False, group_size=cache.group_size, bits=cache.bits,
     )
 
-    # --- Inverse rotation (optional) ---
+    # Inverse rotation (optional)
     if cache.use_rotation:
         output = output @ cache.rotation_matrix
 
