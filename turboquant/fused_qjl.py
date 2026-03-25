@@ -80,7 +80,7 @@ def fused_qjl_scores(
     sign_bits: mx.array,
     residual_norms: mx.array,
     D: int,
-    qjl_scale: float,
+    qjl_scale,
 ) -> mx.array:
     """Fused QJL score computation — avoids 32x sign bit blowup.
 
@@ -92,7 +92,7 @@ def fused_qjl_scores(
         sign_bits: (B * n_kv_heads, T_kv, D // 32) uint32
         residual_norms: (B * n_kv_heads, T_kv) float32
         D: head dimension
-        qjl_scale: sqrt(pi/2) / D
+        qjl_scale: float or pre-computed mx.array([scale], float32)
 
     Returns:
         qjl_scores: (B * n_kv_heads * n_repeats, T_kv) float32
@@ -103,7 +103,10 @@ def fused_qjl_scores(
     if T_kv == 0:
         return mx.zeros((total_bhr, T_kv))
 
-    scale_arr = mx.array([qjl_scale], dtype=mx.float32)
+    if isinstance(qjl_scale, (int, float)):
+        scale_arr = mx.array([qjl_scale], dtype=mx.float32)
+    else:
+        scale_arr = qjl_scale
 
     outputs = _fused_qjl_kernel(
         inputs=[q_sketch, sign_bits, residual_norms, scale_arr],

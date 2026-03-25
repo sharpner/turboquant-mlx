@@ -8,6 +8,8 @@ Pre-allocation with step=256 like MLX's QuantizedKVCache for minimal
 allocation overhead.
 """
 
+import math
+
 import mlx.core as mx
 from mlx.utils import tree_map
 
@@ -60,6 +62,9 @@ class TurboQuantKVCacheV2:
             self.jl_matrix = generate_jl_matrix(head_dim, seed=seed + 95)
             mx.eval(self.jl_matrix)
             self.combined_rot_jl = build_combined_rot_jl(self.rotation_matrix, self.jl_matrix)
+            self.qjl_scale = math.sqrt(math.pi / 2.0) / head_dim
+            self.qjl_scale_arr = mx.array([self.qjl_scale], dtype=mx.float32)
+            mx.eval(self.qjl_scale_arr)
 
         self.keys = None
         self.values = None

@@ -7,8 +7,6 @@ QJL uses a fused Metal kernel for sign-bit dot products (T_q=1),
 avoiding the 32x memory blowup from unpacking sign bits to float.
 """
 
-import math
-
 import mlx.core as mx
 from mlx.utils import tree_map
 
@@ -56,13 +54,12 @@ def turboquant_v2_sdpa(
 
     # QJL correction (optional)
     if cache.use_qjl and cache.key_sign_bits is not None:
-        qjl_scale = math.sqrt(math.pi / 2.0) / D
         if T_q == 1:
             # Fused Metal kernel: reads packed sign bits directly
             q_sketch_flat = q_sketch.reshape(B * n_kv_heads * n_repeats, D)
             sign_bits_flat = cache.key_sign_bits[:, :, :T_kv, :].reshape(B * n_kv_heads, T_kv, -1)
             norms_flat = cache.key_residual_norms[:, :, :T_kv].reshape(B * n_kv_heads, T_kv)
-            qjl_flat = fused_qjl_scores(q_sketch_flat, sign_bits_flat, norms_flat, D, qjl_scale)
+            qjl_flat = fused_qjl_scores(q_sketch_flat, sign_bits_flat, norms_flat, D, cache.qjl_scale)
             qjl_scores = qjl_flat.reshape(B, n_kv_heads, n_repeats, 1, T_kv)
         else:
             # Prefill fallback: unpack + matmul
@@ -70,7 +67,7 @@ def turboquant_v2_sdpa(
             k_signs = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
             k_signs_exp = k_signs[:, :, None, :, :]
             qjl_scores = q_sketch_grouped @ k_signs_exp.transpose(0, 1, 2, 4, 3)
-            qjl_scores = qjl_scores * qjl_scale * cache.key_residual_norms[:, :, :T_kv][:, :, None, None, :]
+            qjl_scores = qjl_scores * cache.qjl_scale * cache.key_residual_norms[:, :, :T_kv][:, :, None, None, :]
         scores = scores + qjl_scores
 
     # Mask

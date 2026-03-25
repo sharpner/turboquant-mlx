@@ -78,6 +78,9 @@ class TurboQuantKVCacheV3:
         outlier_bits: int = 3,
         seed: int = 42,
     ):
+        if n_outlier > head_dim:
+            raise ValueError(f"n_outlier ({n_outlier}) must be <= head_dim ({head_dim})")
+
         self.head_dim = head_dim
         self.bits = bits
         self.use_qjl = use_qjl
