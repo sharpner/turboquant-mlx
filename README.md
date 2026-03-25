@@ -31,11 +31,12 @@ Tested on Apple M4 Max (64 GB), models from `mlx-community` (4-bit weight quanti
 ```
 Strategy              T=512   T=1024   T=2048   T=4096   T=8192
 ──────────────────────────────────────────────────────────────────
-Standard fp16          207      200      190      175      148
-MLX 4-bit Quant        188      189      183      175      156
-V2 4-bit LEAN          188      189      185      174      156
-V2 4-bit (rotated)     135      133      131      123      115
-V3 3.5-bit mixed        83       74       59       42       24
+Standard fp16          208      199      191      175      148
+MLX 4-bit Quant        188      188      184      174      156
+V2 4-bit LEAN          188      188      184      174      156
+V2 4-bit (rotated)     135      130      131      124      115
+V2 3-bit rot+QJL        93       89       80       61       41
+V3 3.5-bit mixed        82       74       59       42       24
 V3 3-bit Lloyd-Max      98       86       70       47       27
 V3 2.5-bit mixed        83       75       59       42       24
 ```
@@ -59,7 +60,7 @@ V3 uses software dequant (centroid lookup + `mx.matmul`) — slower but paper-co
 |----------|----------|---------|---------|-------|
 | Maximum speed | V2 4-bit LEAN | +0.6-4% PPL | +1.6% PPL | ~105% of fp16 at 8K |
 | Best quality at 4-bit | V2 4-bit rotated | -0.8 to +1.4% | +2.9% | ~78% of fp16 |
-| Best 3-bit (D=256) | V2 3-bit rot+QJL | +5-8% | **-1.1%** | ~78% of fp16 |
+| Best 3-bit (D=256) | V2 3-bit rot+QJL | +5-8% | **-1.1%** | ~28% of fp16 at 8K |
 | Near-lossless compression | V3 3.5-bit mixed | +0.3-7% | +2.1% | ~16% of fp16 |
 | Balanced | V3 3-bit Lloyd-Max | +5-9% | +6.2% | ~18% of fp16 |
 | Aggressive compression | V3 2.5-bit mixed | +11-35% | +7.0% | ~16% of fp16 |
