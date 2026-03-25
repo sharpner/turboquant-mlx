@@ -2,7 +2,7 @@
 
 Reproduction of KV-Cache quantization from [TurboQuant (Google, 2025)](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) ([Paper](https://arxiv.org/abs/2504.19874)) on Apple Silicon using [MLX](https://github.com/ml-explore/mlx).
 
-**Result:** Up to 5.5x KV-Cache compression. Two paths: V2 (hardware-accelerated, `mx.quantized_matmul`) for speed, V3 (Lloyd-Max codebook, paper-correct) for maximum quality. Pure MLX — zero custom Metal kernels.
+**Result:** Up to 5.5x KV-Cache compression. Two paths: V2 (hardware-accelerated, `mx.quantized_matmul`) for speed, V3 (Lloyd-Max codebook, paper-correct) for maximum quality. Mostly MLX-native ops, with a custom Metal kernel for fused QJL sign-bit scoring.
 
 ## Benchmark Results
 
@@ -106,7 +106,7 @@ V3 uses software dequant (centroid lookup + `mx.matmul`) — slower but paper-co
 |---------|:---:|:---:|:---:|:---:|---|
 | **LEAN** | — | — | — | Fastest | `mx.quantize` directly. Matches MLX built-in `QuantizedKVCache`. |
 | **rotated** | ✓ | ✓ | — | ~70% | Random QR rotation + norm-baking. Best 4-bit quality. |
-| **rotated+QJL** | ✓ | ✓ | ✓ | ~70% | +1-bit residual correction. Helps at 3-bit. |
+| **rotated+QJL** | ✓ | ✓ | ✓ | ~30% | +1-bit residual correction. Fused Metal kernel for sign-bit scoring. |
 
 ### V3 Variants (Lloyd-Max Codebook, Paper-Correct)
 
@@ -222,14 +222,16 @@ turboquant/
 ├── codebook.py          # Lloyd-Max optimal centroids (1-4 bit)
 ├── codebook_ops.py      # Pure MLX pack/unpack for 2/3/4-bit indices
 ├── qjl.py               # Pure MLX QJL encoding (sign-bit packing)
+├── fused_qjl.py         # Fused Metal kernel for QJL sign-bit dot products
 ├── patch.py             # Monkey-patch for mlx-lm SDPA dispatch
-├── rotation.py          # Random rotation (QR) matrix generation
+├── rotation.py          # Random rotation (QR) + JL matrix generation
 ├── kernels.py           # V1: Metal kernels + packing (legacy)
 ├── cache.py             # V1: cache (legacy)
 ├── attention.py         # V1: attention (legacy)
 └── attention_fused.py   # V1: fused attention (legacy)
 
 benchmark.py             # Speed + quality benchmark
+benchmark_common.py      # Shared eval text and perplexity computation
 benchmark_longseq.py     # Long-context throughput benchmark
 benchmark_models.py      # Multi-model PPL comparison
 run_llm.py               # Interactive demo
