@@ -1,11 +1,11 @@
 """TurboQuant Long-Sequence Benchmark.
 
-Misst Throughput bei verschiedenen KV-Cache Größen.
-Bei langen Sequenzen dominiert Cache-Bandbreite → TurboQuant-Kompression zahlt sich aus.
+Measures throughput at various KV-Cache sizes.
+For long sequences, cache bandwidth dominates → TurboQuant compression pays off.
 
 Apple M3: ~100 GB/s Bandwidth
-- fp16 @ T=1000: ~196 MB Cache-Reads pro Forward → 1.96 ms
-- V2 3-bit @ T=1000: ~41 MB Cache-Reads → 0.41 ms (4.7x weniger)
+- fp16 @ T=1000: ~196 MB cache reads per forward → 1.96 ms
+- V2 3-bit @ T=1000: ~41 MB cache reads → 0.41 ms (4.7x less)
 """
 
 import time
@@ -13,14 +13,34 @@ import time
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
-from mlx_lm.models.cache import make_prompt_cache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache, make_prompt_cache, QuantizedKVCache
 
 from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.cache_v3 import TurboQuantKVCacheV3
+
+
+def _cache_nbytes(cache_layer) -> int:
+    """Computes cache memory in bytes. Workaround for mlx-lm bug where
+    QuantizedKVCache.nbytes crashes due to missing tree_reduce import."""
+    if hasattr(cache_layer, 'is_turboquant') or hasattr(cache_layer, 'is_turboquant_v2') or hasattr(cache_layer, 'is_turboquant_v3'):
+        return cache_layer.nbytes
+    if isinstance(cache_layer, KVCache):
+        if cache_layer.keys is None:
+            return 0
+        return cache_layer.keys.nbytes + cache_layer.values.nbytes
+    if isinstance(cache_layer, QuantizedKVCache):
+        if cache_layer.keys is None:
+            return 0
+        total = 0
+        for tensor in (*cache_layer.keys, *cache_layer.values):
+            total += tensor.nbytes
+        return total
+    return 0
 import turboquant.patch as tq_patch
 tq_patch.apply()
 
 MODEL_NAME = "mlx-community/Llama-3.2-3B-Instruct-4bit"
-GENERATE_TOKENS = 50  # Tokens zum Messen nach Prefill
+GENERATE_TOKENS = 50  # Tokens to measure after prefill
 
 
 def make_cache(model, strategy):
@@ -61,18 +81,39 @@ def make_cache(model, strategy):
             TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, use_rotation=False, use_normalization=False, seed=42 + i)
             for i in range(n_layers)
         ]
-    raise ValueError(f"Unbekannte Strategie: {strategy}")
+    if strategy == "tqv2_3bit_rot_qjl":
+        return [
+            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64,
+                use_rotation=True, use_normalization=True, use_qjl=True, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_3bit":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=False, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_3.5bit":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, n_outlier=head_dim // 2, outlier_bits=4, use_qjl=False, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_2.5bit":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, n_outlier=head_dim // 2, outlier_bits=3, use_qjl=False, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 def build_long_prompt(tokenizer, target_tokens):
-    """Baut einen Prompt der ~target_tokens lang ist."""
+    """Builds a prompt that is ~target_tokens long."""
     base = (
-        "Die Geschichte der Menschheit ist lang und vielfältig. "
-        "Von den ersten Zivilisationen in Mesopotamien über das Römische Reich "
-        "bis hin zur industriellen Revolution hat sich die Welt stetig verändert. "
-        "Technologie, Wissenschaft und Kultur haben sich weiterentwickelt. "
+        "The history of humanity is long and diverse. "
+        "From the first civilizations in Mesopotamia through the Roman Empire "
+        "to the industrial revolution, the world has steadily changed. "
+        "Technology, science and culture have continued to evolve. "
     )
-    # Repeat bis wir genug Tokens haben
+    # Repeat until we have enough tokens
     text = base
     while True:
         tokens = tokenizer.encode(text)
@@ -82,7 +123,7 @@ def build_long_prompt(tokenizer, target_tokens):
 
 
 def measure_generation_speed(model, tokenizer, cache, prompt_tokens, n_generate):
-    """Prefill prompt, dann messe Generation-Speed."""
+    """Prefill prompt, then measure generation speed."""
     input_ids = mx.array(prompt_tokens)
 
     tokens = []
@@ -96,7 +137,7 @@ def measure_generation_speed(model, tokenizer, cache, prompt_tokens, n_generate)
         prompt_cache=cache,
     )):
         if not prefill_done:
-            # Erster Token = Prefill fertig
+            # First token = prefill done
             prefill_done = True
             gen_start = time.perf_counter()
 
@@ -112,10 +153,7 @@ def measure_generation_speed(model, tokenizer, cache, prompt_tokens, n_generate)
 
     cache_bytes = 0
     for c in cache:
-        try:
-            cache_bytes += c.nbytes
-        except (AttributeError, NameError):
-            pass
+        cache_bytes += _cache_nbytes(c)
 
     return {
         "n_tokens": len(tokens),
@@ -127,28 +165,29 @@ def measure_generation_speed(model, tokenizer, cache, prompt_tokens, n_generate)
 
 
 def main():
-    print(f"Lade Modell: {MODEL_NAME}")
+    print(f"Loading model: {MODEL_NAME}")
     model, tokenizer = mlx_lm.load(MODEL_NAME)
-    print(f"Modell geladen: {len(model.layers)} Layer\n")
+    print(f"Model loaded: {len(model.layers)} layers\n")
 
     strategies = [
         ("fp16", "Standard fp16"),
         ("quant4", "MLX 4-bit Quant"),
-        ("tqv2_4bit_lean", "TQ-V2 4bit LEAN"),
-        ("tqv2_3bit_lean", "TQ-V2 3bit LEAN"),
-        ("tqv2_4bit_norot", "TQ-V2 4bit NO-ROT"),
-        ("tqv2_3bit_norot", "TQ-V2 3bit NO-ROT"),
-        ("tqv2_4bit", "TQ-V2 4bit (rot)"),
+        ("tqv2_4bit_lean", "V2 4bit LEAN"),
+        ("tqv2_4bit", "V2 4bit (rotated)"),
+        ("tqv2_3bit_rot_qjl", "V2 3bit rot+QJL"),
+        ("tqv3_3.5bit", "V3 3.5bit mixed"),
+        ("tqv3_3bit", "V3 3bit Lloyd-Max"),
+        ("tqv3_2.5bit", "V3 2.5bit mixed"),
     ]
 
     context_lengths = [512, 1024, 2048, 4096, 8192]
 
-    # Sammle Ergebnisse
+    # Collect results
     all_results = {}
 
     for ctx_len in context_lengths:
         print(f"\n{'='*70}")
-        print(f"Context Length: {ctx_len} tokens (+ {GENERATE_TOKENS} generiert)")
+        print(f"Context Length: {ctx_len} tokens (+ {GENERATE_TOKENS} generated)")
         print(f"{'='*70}")
 
         prompt_tokens = build_long_prompt(tokenizer, ctx_len)
@@ -162,12 +201,12 @@ def main():
             all_results[key] = result
             print(f"  {label:20s}  {result['tok_per_sec']:>7.1f} tok/s  Cache: {result['cache_bytes']:>12,} B")
 
-    # --- Zusammenfassung ---
+    # --- Summary ---
     print(f"\n\n{'='*70}")
-    print("Zusammenfassung: Tok/s bei verschiedenen Context-Längen")
+    print("Summary: Tok/s at various context lengths")
     print(f"{'='*70}")
 
-    header = f"{'Strategie':20s}"
+    header = f"{'Strategy':20s}"
     for ctx_len in context_lengths:
         header += f" {'T=' + str(ctx_len):>10s}"
     print(header)
@@ -180,8 +219,8 @@ def main():
             row += f" {result['tok_per_sec']:>10.1f}"
         print(row)
 
-    # Relative Performance
-    print(f"\n{'Strategie':20s}", end="")
+    # Relative performance
+    print(f"\n{'Strategy':20s}", end="")
     for ctx_len in context_lengths:
         print(f" {'T=' + str(ctx_len):>10s}", end="")
     print()
@@ -198,15 +237,15 @@ def main():
             row += f" {pct:>9.1f}%"
         print(row)
 
-    # Cache Größen
+    # Cache sizes
     max_ctx = context_lengths[-1]
-    print(f"\nCache-Größe bei T={max_ctx}:")
+    print(f"\nCache size at T={max_ctx}:")
     for strategy, label in strategies:
         result = all_results[(strategy, max_ctx)]
         print(f"  {label:20s}  {result['cache_bytes']:>12,} B")
     fp16_bytes = all_results[("fp16", max_ctx)]["cache_bytes"]
     if fp16_bytes > 0:
-        print(f"\nKompression vs fp16 bei T={max_ctx}:")
+        print(f"\nCompression vs fp16 at T={max_ctx}:")
         for strategy, label in strategies:
             if strategy == "fp16":
                 continue

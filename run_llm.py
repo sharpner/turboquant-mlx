@@ -1,7 +1,7 @@
-"""TurboQuant LLM Demo — Llama 3.2 3B mit TurboQuant V2 KV-Cache.
+"""TurboQuant LLM Demo — Llama 3.2 3B with TurboQuant V2 KV-Cache.
 
-V2 nutzt PolarQuant-Rotation + MLX-native mx.quantized_matmul für
-maximale Hardware-Nähe auf Apple Silicon.
+V2 uses random QR rotation + MLX-native mx.quantized_matmul for
+maximum hardware affinity on Apple Silicon.
 """
 
 import time
@@ -15,12 +15,12 @@ import turboquant.patch as tq_patch
 tq_patch.apply()
 
 MODEL_NAME = "mlx-community/Llama-3.2-3B-Instruct-4bit"
-PROMPT = "Erkläre einem Kind, warum der Himmel blau ist."
+PROMPT = "Explain to a child why the sky is blue."
 MAX_TOKENS = 100
 
 
 def make_turboquant_cache(model, bits=3, group_size=64, use_qjl=False):
-    """Erstellt TurboQuant V2 KV-Caches für alle Layer."""
+    """Creates TurboQuant V2 KV-Caches for all layers."""
     head_dim = model.layers[0].self_attn.head_dim
     return [
         TurboQuantKVCacheV2(
@@ -32,7 +32,7 @@ def make_turboquant_cache(model, bits=3, group_size=64, use_qjl=False):
 
 
 def generate_with_cache(model, tokenizer, prompt, cache, max_tokens=100):
-    """Generiert Text mit benutzerdefiniertem Cache."""
+    """Generates text with custom cache."""
     messages = [{"role": "user", "content": prompt}]
     formatted = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -59,16 +59,16 @@ def generate_with_cache(model, tokenizer, prompt, cache, max_tokens=100):
 
 
 def main():
-    print(f"Lade Modell: {MODEL_NAME}")
+    print(f"Loading model: {MODEL_NAME}")
     model, tokenizer = mlx_lm.load(MODEL_NAME)
 
     head_dim = model.layers[0].self_attn.head_dim
     n_layers = len(model.layers)
-    print(f"Modell geladen: {n_layers} Layer, head_dim={head_dim}")
+    print(f"Model loaded: {n_layers} layers, head_dim={head_dim}")
 
     configs = [
-        ("TQ-V2 3-bit (PolarQuant + mx.quantized_matmul)", dict(bits=3)),
-        ("TQ-V2 4-bit (PolarQuant + mx.quantized_matmul)", dict(bits=4)),
+        ("TQ-V2 3-bit (rotation + mx.quantized_matmul)", dict(bits=3)),
+        ("TQ-V2 4-bit (rotation + mx.quantized_matmul)", dict(bits=4)),
     ]
 
     for label, kwargs in configs:
@@ -85,11 +85,11 @@ def main():
         tq_fp16_equiv = sum(c.nbytes_equivalent_fp16 for c in tq_cache)
 
         print(f"\nPrompt: {PROMPT}")
-        print(f"Antwort ({n_tokens} tokens, {elapsed:.2f}s, {n_tokens/elapsed:.1f} tok/s):")
+        print(f"Response ({n_tokens} tokens, {elapsed:.2f}s, {n_tokens/elapsed:.1f} tok/s):")
         print(f"  {text}")
-        print(f"\nCache: {tq_nbytes:,} bytes ({tq_fp16_equiv/tq_nbytes:.1f}x Kompression vs fp16)")
+        print(f"\nCache: {tq_nbytes:,} bytes ({tq_fp16_equiv/tq_nbytes:.1f}x compression vs fp16)")
 
-    # Standard zum Vergleich
+    # Standard for comparison
     print(f"\n{'='*60}")
     print("Standard KV-Cache (float16)")
     print(f"{'='*60}")
@@ -100,7 +100,7 @@ def main():
         model, tokenizer, PROMPT, std_cache, MAX_TOKENS
     )
     std_nbytes = sum(c.nbytes for c in std_cache)
-    print(f"\nAntwort ({n_tokens2} tokens, {elapsed2:.2f}s, {n_tokens2/elapsed2:.1f} tok/s):")
+    print(f"\nResponse ({n_tokens2} tokens, {elapsed2:.2f}s, {n_tokens2/elapsed2:.1f} tok/s):")
     print(f"  {text2}")
     print(f"\nCache: {std_nbytes:,} bytes")
 

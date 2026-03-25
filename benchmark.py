@@ -1,6 +1,6 @@
-"""TurboQuant Benchmark — Vergleich verschiedener KV-Cache Strategien.
+"""TurboQuant Benchmark — Comparison of different KV-Cache strategies.
 
-Misst Memory, Tokens/Sekunde und Perplexity für:
+Measures memory, tokens/second and perplexity for:
   1. Standard fp16 KVCache
   2. MLX QuantizedKVCache (4-bit)
   3. MLX QuantizedKVCache (8-bit)
@@ -16,17 +16,57 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 
 from turboquant.cache import TurboQuantKVCache
 from turboquant.cache_v2 import TurboQuantKVCacheV2
+from turboquant.cache_v3 import TurboQuantKVCacheV3
 import turboquant.patch as tq_patch
 tq_patch.apply()
 
+def _cache_nbytes(cache_layer) -> int:
+    """Computes cache memory in bytes. Workaround for mlx-lm bug where
+    QuantizedKVCache.nbytes crashes due to missing tree_reduce import."""
+    # TurboQuant caches have working .nbytes
+    if hasattr(cache_layer, 'is_turboquant') or hasattr(cache_layer, 'is_turboquant_v2') or hasattr(cache_layer, 'is_turboquant_v3'):
+        return cache_layer.nbytes
+    # KVCache (fp16)
+    if isinstance(cache_layer, KVCache):
+        if cache_layer.keys is None:
+            return 0
+        return cache_layer.keys.nbytes + cache_layer.values.nbytes
+    # QuantizedKVCache — tree_reduce is broken in mlx-lm, sum manually
+    if isinstance(cache_layer, QuantizedKVCache):
+        if cache_layer.keys is None:
+            return 0
+        total = 0
+        for tensor in (*cache_layer.keys, *cache_layer.values):
+            total += tensor.nbytes
+        return total
+    return 0
+
+
 MODEL_NAME = "mlx-community/Llama-3.2-3B-Instruct-4bit"
-PROMPT = "Schreibe eine kurze Geschichte über einen Roboter, der kochen lernt."
+PROMPT = "Write a short story about a robot learning to cook."
 MAX_TOKENS = 150
-EVAL_TEXT = "Die Katze saß auf der Matte und schaute aus dem Fenster. Draußen regnete es."
+EVAL_TEXT = (
+    "The history of artificial intelligence began in antiquity, with myths, stories and rumors of "
+    "artificial beings endowed with intelligence or consciousness by master craftsmen. The seeds of "
+    "modern AI were planted by philosophers who attempted to describe the process of human thinking "
+    "as the mechanical manipulation of symbols. This work culminated in the invention of the "
+    "programmable digital computer in the 1940s, a machine based on the abstract essence of "
+    "mathematical reasoning. This device and the ideas behind it inspired a handful of scientists "
+    "to begin seriously discussing the possibility of building an electronic brain. The field of AI "
+    "research was founded at a workshop held on the campus of Dartmouth College during the summer "
+    "of 1956. Those who attended would become the leaders of AI research for decades. Many of them "
+    "predicted that a machine as intelligent as a human being would exist in no more than a "
+    "generation, and they were given millions of dollars to make this vision come true. Eventually, "
+    "it became obvious that commercial developers and researchers had grossly underestimated the "
+    "difficulty of the project. In 1974, in response to the criticism from James Lighthill and "
+    "ongoing pressure from congress, the U.S. and British governments cut off exploratory research "
+    "in AI. The next few years would later be called an AI winter, a period when obtaining funding "
+    "for AI projects was difficult."
+)
 
 
 def make_cache(model, strategy):
-    """Erstellt Cache basierend auf Strategie."""
+    """Creates cache based on strategy."""
     n_layers = len(model.layers)
     head_dim = model.layers[0].self_attn.head_dim
 
@@ -91,11 +131,32 @@ def make_cache(model, strategy):
             TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, seed=42 + i)
             for i in range(n_layers)
         ]
-    raise ValueError(f"Unbekannte Strategie: {strategy}")
+    # --- V3: Lloyd-Max Codebook (paper-correct) ---
+    if strategy == "tqv3_2bit":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, use_qjl=False, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_2bit_prod":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, use_qjl=True, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_3bit":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=False, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    if strategy == "tqv3_3bit_prod":
+        return [
+            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=True, seed=42 + i)
+            for i in range(n_layers)
+        ]
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
-    """Generiert Text und misst Performance."""
+    """Generates text and measures performance."""
     messages = [{"role": "user", "content": PROMPT}]
     formatted = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -121,10 +182,7 @@ def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
 
     cache_bytes = 0
     for c in cache:
-        try:
-            cache_bytes += c.nbytes
-        except (AttributeError, NameError):
-            pass
+        cache_bytes += _cache_nbytes(c)
 
     return {
         "text": text,
@@ -136,7 +194,7 @@ def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
 
 
 def compute_perplexity(model, tokenizer, text, cache):
-    """Berechnet Perplexity auf einem Evaluierungs-Text."""
+    """Computes perplexity on an evaluation text."""
     input_ids = mx.array(tokenizer.encode(text))[None]  # (1, T)
     T = input_ids.shape[1]
 
@@ -144,7 +202,7 @@ def compute_perplexity(model, tokenizer, text, cache):
         return float("inf")
 
     logits = model(input_ids, cache=cache)
-    # Shift: logits[:-1] vorhersagt tokens[1:]
+    # Shift: logits[:-1] predicts tokens[1:]
     shift_logits = logits[:, :-1, :]
     shift_labels = input_ids[:, 1:]
 
@@ -158,9 +216,9 @@ def compute_perplexity(model, tokenizer, text, cache):
 
 
 def main():
-    print(f"Lade Modell: {MODEL_NAME}")
+    print(f"Loading model: {MODEL_NAME}")
     model, tokenizer = mlx_lm.load(MODEL_NAME)
-    print(f"Modell geladen: {len(model.layers)} Layer\n")
+    print(f"Model loaded: {len(model.layers)} layers\n")
 
     strategies = [
         ("fp16", "Standard fp16"),
@@ -170,6 +228,11 @@ def main():
         ("tqv2_4bit_norot", "V2 4bit NO-ROT"),
         ("tqv2_3bit_norot", "V2 3bit NO-ROT"),
         ("tqv2_4bit", "V2 4bit (rotated)"),
+        # V3: Lloyd-Max codebook (paper-correct)
+        ("tqv3_3bit", "V3 3bit (Lloyd-Max)"),
+        ("tqv3_3bit_prod", "V3 3bit prod (2b+QJL)"),
+        ("tqv3_2bit", "V3 2bit (Lloyd-Max)"),
+        ("tqv3_2bit_prod", "V3 2bit prod (1b+QJL)"),
     ]
 
     results = {}
@@ -183,15 +246,15 @@ def main():
         results[strategy] = result
 
         print(f"  Tokens:    {result['n_tokens']}")
-        print(f"  Zeit:      {result['elapsed']:.2f}s")
+        print(f"  Time:      {result['elapsed']:.2f}s")
         print(f"  Tok/s:     {result['tok_per_sec']:.1f}")
         print(f"  Cache:     {result['cache_bytes']:,} bytes")
-        print(f"  Antwort:   {result['text'][:120]}...")
+        print(f"  Response:  {result['text'][:120]}...")
         print()
 
     # --- Perplexity ---
     print(f"\n{'='*60}")
-    print("Perplexity Vergleich")
+    print("Perplexity Comparison")
     print(f"{'='*60}")
     print(f"Eval-Text: \"{EVAL_TEXT[:60]}...\"")
     print()
@@ -202,21 +265,21 @@ def main():
         results[strategy]["perplexity"] = ppl
         print(f"  {label:25s}  PPL: {ppl:.2f}")
 
-    # --- Zusammenfassung ---
+    # --- Summary ---
     print(f"\n{'='*60}")
-    print("Zusammenfassung")
+    print("Summary")
     print(f"{'='*60}")
-    print(f"{'Strategie':25s} {'Tok/s':>8s} {'Cache':>12s} {'PPL':>8s}")
+    print(f"{'Strategy':25s} {'Tok/s':>8s} {'Cache':>12s} {'PPL':>8s}")
     print("-" * 55)
     for strategy, label in strategies:
         r = results[strategy]
         ppl_str = f"{r.get('perplexity', 0):.2f}"
         print(f"{label:25s} {r['tok_per_sec']:>8.1f} {r['cache_bytes']:>10,} B {ppl_str:>8s}")
 
-    # Kompression
+    # Compression
     fp16_bytes = results["fp16"]["cache_bytes"]
     if fp16_bytes > 0:
-        print(f"\nKompression vs fp16:")
+        print(f"\nCompression vs fp16:")
         for strategy, label in strategies:
             if strategy == "fp16":
                 continue

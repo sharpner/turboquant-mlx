@@ -1,6 +1,7 @@
-"""Monkey-Patch für mlx-lm's SDPA Dispatch.
+"""Monkey-patch for mlx-lm's SDPA dispatch.
 
-Unterstützt TurboQuant V1 (fused Metal Kernel), V2 (mx.quantized_matmul).
+Supports TurboQuant V1 (fused Metal kernel), V2 (mx.quantized_matmul),
+V3 (Lloyd-Max codebook with software dequant).
 """
 
 import mlx.core as mx
@@ -8,12 +9,15 @@ import mlx_lm.models.base as _base
 
 from turboquant.attention_fused import turboquant_fused_sdpa
 from turboquant.attention_v2 import turboquant_v2_sdpa
+from turboquant.attention_v3 import turboquant_v3_sdpa
 
 _original_sdpa = _base.scaled_dot_product_attention
 _patched = False
 
 
 def _patched_sdpa(queries, keys, values, cache, scale, mask, **kwargs):
+    if getattr(cache, "is_turboquant_v3", False):
+        return turboquant_v3_sdpa(queries, cache, scale, mask)
     if getattr(cache, "is_turboquant_v2", False):
         return turboquant_v2_sdpa(queries, keys, values, cache, scale, mask)
     if getattr(cache, "is_turboquant", False):
@@ -22,7 +26,7 @@ def _patched_sdpa(queries, keys, values, cache, scale, mask, **kwargs):
 
 
 def apply():
-    """Aktiviert den TurboQuant SDPA-Patch. Idempotent."""
+    """Activates the TurboQuant SDPA patch. Idempotent."""
     global _patched
     if _patched:
         return
@@ -31,7 +35,7 @@ def apply():
 
 
 def revert():
-    """Entfernt den Patch."""
+    """Removes the patch."""
     global _patched
     _base.scaled_dot_product_attention = _original_sdpa
     _patched = False

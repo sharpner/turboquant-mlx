@@ -1,7 +1,7 @@
-"""Custom Metal Kernels für TurboQuant.
+"""Custom Metal kernels for TurboQuant.
 
-Strategie: Matmul-Operationen (Rotation, Centroid-Lookup) via mx.matmul/mx.take.
-Nur die Bit-Operationen (Quantisierung, Sign-Packing, QJL-Scoring) als Metal Kernels.
+Strategy: Matmul operations (rotation, centroid lookup) via mx.matmul/mx.take.
+Only bit operations (quantization, sign packing, QJL scoring) as Metal kernels.
 """
 
 import math
@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-# --- Kernel 1: Scalar Quantize (Binary Search auf Boundaries) ---
+# --- Kernel 1: Scalar Quantize (binary search on boundaries) ---
 
 _QUANTIZE_SOURCE = """
     uint elem = thread_position_in_grid.x;
@@ -18,7 +18,7 @@ _QUANTIZE_SOURCE = """
 
     float val = rotated[elem];
 
-    // Binary search: zähle wie viele Boundaries kleiner als val
+    // Binary search: count how many boundaries are less than val
     uint idx = 0;
     for (uint b = 0; b < num_boundaries; b++) {
         idx += (val > boundaries[b]) ? 1 : 0;
@@ -35,14 +35,14 @@ _quantize_kernel = mx.fast.metal_kernel(
 
 
 def quantize_to_indices(rotated: mx.array, boundaries: mx.array) -> mx.array:
-    """Quantisiert rotierte Werte zu Centroid-Indices via Binary Search.
+    """Quantizes rotated values to centroid indices via binary search.
 
     Args:
-        rotated: Beliebiger Shape, float32 — die rotierten (und normierten) Koordinaten
-        boundaries: (num_levels - 1,) float32 — sortierte Entscheidungsgrenzen
+        rotated: Any shape, float32 — the rotated (and normalized) coordinates
+        boundaries: (num_levels - 1,) float32 — sorted decision boundaries
 
     Returns:
-        indices: Gleicher Shape wie rotated, uint8
+        indices: Same shape as rotated, uint8
     """
     flat = rotated.reshape(-1)
     outputs = _quantize_kernel(
@@ -58,7 +58,7 @@ def quantize_to_indices(rotated: mx.array, boundaries: mx.array) -> mx.array:
 # --- Kernel 2: Pack Sign Bits in uint32 ---
 
 _PACK_SIGNS_SOURCE = """
-    // Ein Thread pro uint32-Wort (packt 32 Sign-Bits)
+    // One thread per uint32 word (packs 32 sign bits)
     uint word_idx = thread_position_in_grid.x;
     uint base = word_idx * 32;
     uint total = values_shape[0];
@@ -82,18 +82,18 @@ _pack_signs_kernel = mx.fast.metal_kernel(
 
 
 def pack_sign_bits(values: mx.array) -> mx.array:
-    """Packt die Vorzeichen von values in uint32-Wörter (32 bits pro Wort).
+    """Packs the signs of values into uint32 words (32 bits per word).
 
     Args:
-        values: (..., D) float32 — die Projektionswerte
+        values: (..., D) float32 — the projection values
 
     Returns:
-        sign_bits: (..., D // 32) uint32 — gepackte Vorzeichen-Bits
+        sign_bits: (..., D // 32) uint32 — packed sign bits
     """
     original_shape = values.shape
     D = original_shape[-1]
     if D % 32 != 0:
-        raise ValueError(f"Letzte Dimension muss durch 32 teilbar sein, ist {D}")
+        raise ValueError(f"Last dimension must be divisible by 32, got {D}")
 
     flat = values.reshape(-1)
     num_words = flat.size // 32
@@ -108,12 +108,12 @@ def pack_sign_bits(values: mx.array) -> mx.array:
     return outputs[0].reshape(out_shape)
 
 
-# --- Kernel 3: QJL Score — Dot-Product mit gepackten Sign-Bits ---
+# --- Kernel 3: QJL Score — Dot product with packed sign bits ---
 
 _QJL_SCORE_HEADER = """
 inline float popcount_xnor(uint32_t a, uint32_t b) {
-    // XNOR: gleiche Bits = 1, verschiedene = 0
-    // popcount(XNOR) = Anzahl übereinstimmender Bits
+    // XNOR: matching bits = 1, differing = 0
+    // popcount(XNOR) = number of matching bits
     // Score = 2 * matching - total = 2 * popcount(~(a^b)) - 32
     uint32_t xnor_val = ~(a ^ b);
     return static_cast<float>(2 * static_cast<int>(popcount(xnor_val)) - 32);
@@ -122,7 +122,7 @@ inline float popcount_xnor(uint32_t a, uint32_t b) {
 
 _QJL_SCORE_SOURCE = """
     // Grid: (num_queries * num_keys, 1, 1)
-    // Jeder Thread berechnet den QJL-Score für ein (query, key) Paar
+    // Each thread computes the QJL score for one (query, key) pair
     uint pair_idx = thread_position_in_grid.x;
     uint num_keys = key_signs_shape[0];
     uint num_words = key_signs_shape[1];  // D / 32
@@ -132,7 +132,7 @@ _QJL_SCORE_SOURCE = """
 
     float score = 0.0f;
     for (uint w = 0; w < num_words; w++) {
-        // Query-Sketch ist auch als Sign-Bits gepackt
+        // Query sketch is also packed as sign bits
         uint32_t q_word = query_signs[q_idx * num_words + w];
         uint32_t k_word = key_signs[k_idx * num_words + w];
         score += popcount_xnor(q_word, k_word);
@@ -150,16 +150,16 @@ _qjl_score_kernel = mx.fast.metal_kernel(
 
 
 def qjl_score(query_signs: mx.array, key_signs: mx.array) -> mx.array:
-    """Berechnet QJL Inner-Product-Scores zwischen Queries und Keys.
+    """Computes QJL inner-product scores between queries and keys.
 
-    Nutzt XNOR + Popcount für effizientes 1-Bit Dot-Product.
+    Uses XNOR + popcount for efficient 1-bit dot product.
 
     Args:
-        query_signs: (T_q, D // 32) uint32 — gepackte Query-Sketch-Signs
-        key_signs: (T_kv, D // 32) uint32 — gepackte Key-Residual-Signs
+        query_signs: (T_q, D // 32) uint32 — packed query sketch signs
+        key_signs: (T_kv, D // 32) uint32 — packed key residual signs
 
     Returns:
-        scores: (T_q, T_kv) float32 — die QJL-Score-Anteile
+        scores: (T_q, T_kv) float32 — the QJL score components
     """
     T_q = query_signs.shape[0]
     T_kv = key_signs.shape[0]
@@ -178,10 +178,10 @@ def qjl_score(query_signs: mx.array, key_signs: mx.array) -> mx.array:
     return outputs[0].reshape(T_q, T_kv)
 
 
-# --- Kernel 4: Pack 2-bit Indices in uint32 (16 Indices pro Wort) ---
+# --- Kernel 4: Pack 2-bit Indices in uint32 (16 indices per word) ---
 
 _PACK_2BIT_SOURCE = """
-    // Ein Thread pro uint32-Wort (packt 16 2-bit Indices)
+    // One thread per uint32 word (packs 16 2-bit indices)
     uint word_idx = thread_position_in_grid.x;
     uint base = word_idx * 16;
     uint total = indices_shape[0];
@@ -205,10 +205,10 @@ _pack_2bit_kernel = mx.fast.metal_kernel(
 
 
 def pack_2bit_indices(indices: mx.array) -> mx.array:
-    """Packt 2-bit Indices (0-3) in uint32-Wörter (16 Indices pro Wort).
+    """Packs 2-bit indices (0-3) into uint32 words (16 indices per word).
 
     Args:
-        indices: (..., D) uint8 mit Werten 0-3
+        indices: (..., D) uint8 with values 0-3
 
     Returns:
         packed: (..., D // 16) uint32
@@ -216,7 +216,7 @@ def pack_2bit_indices(indices: mx.array) -> mx.array:
     original_shape = indices.shape
     D = original_shape[-1]
     if D % 16 != 0:
-        raise ValueError(f"Letzte Dimension muss durch 16 teilbar sein, ist {D}")
+        raise ValueError(f"Last dimension must be divisible by 16, got {D}")
 
     flat = indices.reshape(-1)
     num_words = flat.size // 16
@@ -231,26 +231,26 @@ def pack_2bit_indices(indices: mx.array) -> mx.array:
     return outputs[0].reshape(out_shape)
 
 
-# Bit-Masken für 2-bit Entpackung (einmal berechnen)
+# Bit masks for 2-bit unpacking (computed once)
 _SHIFTS_2BIT = mx.array([i * 2 for i in range(16)], dtype=mx.uint32)
 
 
 def unpack_2bit_indices(packed: mx.array, D: int) -> mx.array:
-    """Entpackt uint32 zu 2-bit Indices (0-3).
+    """Unpacks uint32 to 2-bit indices (0-3).
 
     Args:
         packed: (..., D // 16) uint32
-        D: Original-Dimension (z.B. 128)
+        D: Original dimension (e.g. 128)
 
     Returns:
-        indices: (..., D) uint32 mit Werten 0-3
+        indices: (..., D) uint32 with values 0-3
     """
-    # Jedes uint32 zu 16 2-bit Werten expandieren
+    # Expand each uint32 to 16 2-bit values
     expanded = (packed[..., None] >> _SHIFTS_2BIT) & 0x3  # (..., D//16, 16)
     return expanded.reshape(*packed.shape[:-1], D)
 
 
-# --- Kernel 5: Pack 3-bit Indices in uint32 (10 Indices pro Wort, 2 bits unused) ---
+# --- Kernel 5: Pack 3-bit Indices in uint32 (10 indices per word, 2 bits unused) ---
 
 _PACK_3BIT_SOURCE = """
     uint word_idx = thread_position_in_grid.x;
@@ -276,17 +276,17 @@ _pack_3bit_kernel = mx.fast.metal_kernel(
 
 
 def pack_3bit_indices(indices: mx.array) -> mx.array:
-    """Packt 3-bit Indices (0-7) in uint32-Wörter (10 Indices pro Wort).
+    """Packs 3-bit indices (0-7) into uint32 words (10 indices per word).
 
     Args:
-        indices: (..., D) uint8 mit Werten 0-7
+        indices: (..., D) uint8 with values 0-7
 
     Returns:
         packed: (..., ceil(D / 10)) uint32
     """
     original_shape = indices.shape
     D = original_shape[-1]
-    # Padding auf Vielfaches von 10
+    # Padding to multiple of 10
     num_words = (D + 9) // 10
 
     flat = indices.reshape(-1)
@@ -316,14 +316,14 @@ _SHIFTS_3BIT = mx.array([i * 3 for i in range(10)], dtype=mx.uint32)
 
 
 def unpack_3bit_indices(packed: mx.array, D: int) -> mx.array:
-    """Entpackt uint32 zu 3-bit Indices (0-7).
+    """Unpacks uint32 to 3-bit indices (0-7).
 
     Args:
         packed: (..., ceil(D/10)) uint32
-        D: Original-Dimension
+        D: Original dimension
 
     Returns:
-        indices: (..., D) uint32 mit Werten 0-7
+        indices: (..., D) uint32 with values 0-7
     """
     expanded = (packed[..., None] >> _SHIFTS_3BIT) & 0x7  # (..., words, 10)
     total = packed.shape[-1] * 10
@@ -332,64 +332,64 @@ def unpack_3bit_indices(packed: mx.array, D: int) -> mx.array:
     return result[..., :D]
 
 
-# --- High-Level Encode/Decode Funktionen (nutzen Kernels + MLX Ops) ---
+# --- High-level encode/decode functions (use kernels + MLX ops) ---
 
-def polarquant_encode(
+def turboquant_encode(
     vectors: mx.array,
     rotation_matrix: mx.array,
     boundaries: mx.array,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """PolarQuant Encoding: Normalisieren → Rotieren → Scalar Quantize.
+    """TurboQuant encoding: Normalize -> Rotate -> Scalar Quantize.
 
     Args:
-        vectors: (..., D) float32 — Input-Vektoren
-        rotation_matrix: (D, D) float32 — orthogonale Matrix Pi
-        boundaries: (num_levels - 1,) float32 — Quantisierungsgrenzen (unskaliert)
+        vectors: (..., D) float32 — input vectors
+        rotation_matrix: (D, D) float32 — orthogonal matrix Pi
+        boundaries: (num_levels - 1,) float32 — quantization boundaries (unscaled)
 
     Returns:
-        indices: (..., D) uint8 — Centroid-Indices
-        norms: (...,) float32 — L2-Normen der Inputs
-        rotated_normalized: (..., D) float32 — rotierte normalisierte Vektoren (für Residual)
+        indices: (..., D) uint8 — centroid indices
+        norms: (...,) float32 — L2 norms of inputs
+        rotated_normalized: (..., D) float32 — rotated normalized vectors (for residual)
     """
-    # L2-Norm pro Vektor
+    # L2 norm per vector
     norms = mx.linalg.norm(vectors, axis=-1, keepdims=True)
-    # Guard: Null-Vektoren abfangen
+    # Guard: handle zero vectors
     safe_norms = mx.where(norms < 1e-8, mx.ones_like(norms), norms)
     normalized = vectors / safe_norms
 
-    # Rotieren: x_rot = x_norm @ Pi^T
+    # Rotate: x_rot = x_norm @ Pi^T
     rotated = normalized @ rotation_matrix.T
 
-    # Scalar Quantize via Metal Kernel
+    # Scalar quantize via Metal kernel
     indices = quantize_to_indices(rotated, boundaries)
 
     return indices, norms.squeeze(-1), rotated
 
 
-def polarquant_decode(
+def turboquant_decode(
     indices: mx.array,
     rotation_matrix: mx.array,
     centroids: mx.array,
     norms: mx.array,
 ) -> mx.array:
-    """PolarQuant Decoding: Centroid-Lookup → Inverse Rotation → Skalierung.
+    """TurboQuant decoding: Centroid lookup -> Inverse rotation -> Scaling.
 
     Args:
-        indices: (..., D) uint8 — Centroid-Indices
-        rotation_matrix: (D, D) float32 — orthogonale Matrix Pi
-        centroids: (num_levels,) float32 — Centroid-Werte (unskaliert)
-        norms: (...,) float32 — L2-Normen
+        indices: (..., D) uint8 — centroid indices
+        rotation_matrix: (D, D) float32 — orthogonal matrix Pi
+        centroids: (num_levels,) float32 — centroid values (unscaled)
+        norms: (...,) float32 — L2 norms
 
     Returns:
-        reconstructed: (..., D) float32 — rekonstruierte Vektoren
+        reconstructed: (..., D) float32 — reconstructed vectors
     """
     # Centroid lookup
     centroid_values = centroids[indices.astype(mx.uint32)]
 
-    # Inverse Rotation: x = c @ Pi (= Pi^T @ c da Pi orthogonal → Pi^(-1) = Pi^T)
+    # Inverse rotation: x = c @ Pi (= Pi^T @ c since Pi is orthogonal -> Pi^(-1) = Pi^T)
     reconstructed = centroid_values @ rotation_matrix
 
-    # Skalierung mit Original-Norm
+    # Scale by original norm
     return reconstructed * norms[..., None]
 
 
@@ -397,32 +397,32 @@ def qjl_encode(
     residual: mx.array,
     jl_matrix: mx.array,
 ) -> tuple[mx.array, mx.array]:
-    """QJL Encoding: Projizieren → Sign-Bits packen.
+    """QJL encoding: Project -> Pack sign bits.
 
     Args:
-        residual: (..., D) float32 — Residual-Vektoren (x_norm - dequant_mse(x_norm))
-        jl_matrix: (D, D) float32 — JL Projektionsmatrix S
+        residual: (..., D) float32 — residual vectors (x_norm - dequant_mse(x_norm))
+        jl_matrix: (D, D) float32 — JL projection matrix S
 
     Returns:
-        sign_bits: (..., D // 32) uint32 — gepackte Sign-Bits
+        sign_bits: (..., D // 32) uint32 — packed sign bits
         residual_norms: (...,) float32 — ||residual||_2 (gamma)
     """
-    # Residual-Norm (gamma im Paper)
+    # Residual norm (gamma in the paper)
     residual_norms = mx.linalg.norm(residual, axis=-1)
 
-    # Projektion: p = residual @ S^T
+    # Projection: p = residual @ S^T
     projected = residual @ jl_matrix.T
 
-    # Sign-Bits packen via Metal Kernel
+    # Pack sign bits via Metal kernel
     sign_bits = pack_sign_bits(projected)
 
     return sign_bits, residual_norms
 
 
-# --- Fused Kernel 1: TurboQuant Score (MSE + QJL in einem Kernel) ---
+# --- Fused Kernel 1: TurboQuant Score (MSE + QJL in one kernel) ---
 
 _FUSED_SCORE_SOURCE = """
-    // Grid: (T_kv, n_repeats, 1) — ein Thread pro (key, repeat) Paar
+    // Grid: (T_kv, n_repeats, 1) — one thread per (key, repeat) pair
     uint k = thread_position_in_grid.x;
     uint r = thread_position_in_grid.y;
 
@@ -434,7 +434,7 @@ _FUSED_SCORE_SOURCE = """
 
     if (k >= T_kv) return;
 
-    // q_rot und q_sketch liegen als (n_repeats, D) vor
+    // q_rot and q_sketch are laid out as (n_repeats, D)
     uint q_base = r * D;
 
     // 1. MSE Score: Unpack 2-bit indices + Centroid lookup + Dot product
@@ -449,7 +449,7 @@ _FUSED_SCORE_SOURCE = """
     }
     mse_score *= key_norms[k];
 
-    // 2. QJL Score: Unpack sign bits + Dot product mit q_sketch
+    // 2. QJL Score: Unpack sign bits + Dot product with q_sketch
     float qjl_score = 0.0f;
     for (uint w = 0; w < D_DIV_32; w++) {
         uint32_t signs = key_sign_bits[k * D_DIV_32 + w];
@@ -482,12 +482,12 @@ def fused_tq_scores(
     key_residual_norms: mx.array,
     qjl_scale: mx.array,
 ) -> mx.array:
-    """Fused TurboQuant Score: MSE + QJL in einem Kernel.
+    """Fused TurboQuant score: MSE + QJL in one kernel.
 
     Args:
-        q_rot: (n_repeats, D) float32 — rotierte Queries für einen KV-Head
-        q_sketch: (n_repeats, D) float32 — JL-Sketches
-        key_packed: (T_kv, D//16) uint32 — 2-bit gepackte Keys
+        q_rot: (n_repeats, D) float32 — rotated queries for one KV head
+        q_sketch: (n_repeats, D) float32 — JL sketches
+        key_packed: (T_kv, D//16) uint32 — 2-bit packed keys
         centroids: (4,) float32
         key_norms: (T_kv,) float32
         key_sign_bits: (T_kv, D//32) uint32
@@ -517,7 +517,7 @@ def fused_tq_scores(
 # --- Fused Kernel 2: TurboQuant Value Output ---
 
 _FUSED_VALUE_SOURCE = """
-    // Grid: (D, n_repeats, 1) — ein Thread pro (output_dim, repeat) Paar
+    // Grid: (D, n_repeats, 1) — one thread per (output_dim, repeat) pair
     uint d = thread_position_in_grid.x;
     uint r = thread_position_in_grid.y;
 
@@ -569,11 +569,11 @@ def fused_tq_value_output(
     D: int,
     n_repeats: int,
 ) -> mx.array:
-    """Fused TurboQuant Value Output: Decode + Gewichtete Summe in einem Kernel.
+    """Fused TurboQuant value output: Decode + weighted sum in one kernel.
 
     Args:
-        weights: (T_kv, n_repeats) float32 — Softmax-Gewichte
-        value_packed: (T_kv, D//16) uint32 — 2-bit gepackte Values
+        weights: (T_kv, n_repeats) float32 — softmax weights
+        value_packed: (T_kv, D//16) uint32 — 2-bit packed values
         centroids: (4,) float32
         value_norms: (T_kv,) float32
         rotation_matrix: (D, D) float32 — Pi
@@ -592,10 +592,10 @@ def fused_tq_value_output(
 
 
 # ===========================================================================
-# FUSED FULL ATTENTION KERNEL — Alles in einem Metal Dispatch
+# FUSED FULL ATTENTION KERNEL — Everything in one Metal dispatch
 # ===========================================================================
 # Rotation + Quantized Scoring + Online Softmax + Value Accumulation + Inverse Rotation
-# Pattern: 1 Simdgroup (32 Threads) pro Query-Head, sequentiell über Keys.
+# Pattern: 1 simdgroup (32 threads) per query head, sequential over keys.
 
 _FUSED_ATTN_HEADER = """
 #include <metal_simdgroup>
@@ -604,13 +604,13 @@ using namespace metal;
 
 _FUSED_ATTN_SOURCE = """
     // Grid: (n_q_heads, 1, 1), Threadgroup: (32, 1, 1)
-    // Ein Simdgroup (32 Threads) pro Query-Head
+    // One simdgroup (32 threads) per query head
     // Thread lid handles dims [lid*4, lid*4+1, lid*4+2, lid*4+3]
 
     uint head = threadgroup_position_in_grid.x;
     uint lid = thread_index_in_simdgroup;
 
-    // Dimensionen aus Input-Shapes ableiten
+    // Derive dimensions from input shapes
     uint T_kv = key_norms_shape[1];        // key_norms: (n_kv_heads, T_kv)
     uint n_kv_heads = key_norms_shape[0];
     uint n_q_heads = queries_shape[0];      // queries: (n_q_heads, D)
@@ -647,10 +647,10 @@ _FUSED_ATTN_SOURCE = """
     // ===== PHASE 2: Scoring + Online Softmax + Value Accumulation =====
     float max_score = -HUGE_VALF;
     float sum_exp = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Akkumulator in rotiertem Raum
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Accumulator in rotated space
 
-    uint word_idx = lid / 4;      // Welches uint32 Wort (0..7)
-    uint bit_base = (lid % 4) * 8; // Bit-Offset im Wort (0, 8, 16, 24)
+    uint word_idx = lid / 4;      // Which uint32 word (0..7)
+    uint bit_base = (lid % 4) * 8; // Bit offset within word (0, 8, 16, 24)
 
     for (uint k = 0; k < T_kv; k++) {
         // -- Unpack key centroids for this thread's 4 dims --
@@ -737,12 +737,12 @@ def fused_tq_attention(
     D: int,
     causal_offset: int = 0,
 ) -> mx.array:
-    """Vollständig fused TurboQuant Attention in EINEM Metal Dispatch.
+    """Fully fused TurboQuant attention in ONE Metal dispatch.
 
     Rotation + Quantized Scoring + Online Softmax + Value Accumulation + Inverse Rotation.
 
     Args:
-        queries: (n_q_heads, D) float32 — ALLE Query-Heads (flattened batch)
+        queries: (n_q_heads, D) float32 — ALL query heads (flattened batch)
         rotation_matrix: (D, D) float32 — Pi
         key_packed: (n_kv_heads, T_kv, D//16) uint32 — 2-bit packed
         centroids: (4,) float32
@@ -774,12 +774,12 @@ def fused_tq_attention(
 
 
 # ===========================================================================
-# HIGH-OCCUPANCY FUSED KERNEL — 32 Simdgroups, Rotation außerhalb
+# HIGH-OCCUPANCY FUSED KERNEL — 32 simdgroups, rotation outside
 # ===========================================================================
-# Arbeitet im rotierten Raum: Query wird VOR dem Kernel rotiert (MLX GEMM),
-# Output wird NACH dem Kernel zurückrotiert (MLX GEMM).
-# 32 Simdgroups verarbeiten Keys PARALLEL mit Cross-Simdgroup Online Softmax.
-# Pattern: Wie MLX's sdpa_vector.h — 1024 Threads pro Head.
+# Operates in rotated space: query is rotated BEFORE the kernel (MLX GEMM),
+# output is rotated back AFTER the kernel (MLX GEMM).
+# 32 simdgroups process keys IN PARALLEL with cross-simdgroup online softmax.
+# Pattern: Like MLX's sdpa_vector.h — 1024 threads per head.
 
 _FUSED_ATTN_NOROT_HEADER = """
 #include <metal_simdgroup>
@@ -789,24 +789,24 @@ using namespace metal;
 _FUSED_ATTN_NOROT_SOURCE = """
     // Grid: total threads = n_q_heads * 1024
     // Threadgroup: (1024, 1, 1) = 32 Simdgroups × 32 Lanes
-    // Jede Threadgroup verarbeitet einen Query-Head.
-    // Simdgroups verarbeiten Keys mit Stride 32 (parallel).
+    // Each threadgroup processes one query head.
+    // Simdgroups process keys with stride 32 (parallel).
 
     uint head = threadgroup_position_in_grid.x;
     uint tid = thread_position_in_threadgroup.x;
     uint simd_id = tid >> 5;   // 0..31 (Simdgroup-Index)
     uint lane_id = tid & 31;   // 0..31 (Lane innerhalb Simdgroup)
 
-    // Dimensionen
+    // Dimensions
     uint T_kv = key_norms_shape[1];
     uint n_kv_heads = key_norms_shape[0];
     uint n_q_heads = q_rot_shape[0];
-    uint WORDS = key_packed_shape[2];   // D/16 für 2-bit
+    uint WORDS = key_packed_shape[2];   // D/16 for 2-bit
     uint D = WORDS * 16;
     uint n_repeats = n_q_heads / n_kv_heads;
     uint kv_head = head / n_repeats;
 
-    // Query laden (bereits skaliert und rotiert)
+    // Load query (already scaled and rotated)
     float q[4];
     uint q_off = head * D;
     for (uint i = 0; i < 4; i++)
@@ -816,18 +816,18 @@ _FUSED_ATTN_NOROT_SOURCE = """
     uint kv_off_norms = kv_head * T_kv;
     uint kv_off_packed = kv_head * T_kv * WORDS;
 
-    // Dim-Mapping: Lane → Welches uint32-Wort und Bit-Offset
+    // Dim mapping: lane -> which uint32 word and bit offset
     uint word_idx = lane_id >> 2;        // 0..7
     uint bit_base = (lane_id & 3) << 3;  // 0, 8, 16, 24
 
-    // ===== Scoring + Online Softmax + Value Accumulation (pro Simdgroup) =====
+    // ===== Scoring + Online Softmax + Value Accumulation (per simdgroup) =====
     float local_max = -1e10f;
     float local_sum = 0.0f;
     float local_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Simdgroups verarbeiten Keys mit Stride (32 Simdgroups parallel)
+    // Simdgroups process keys with stride (32 simdgroups in parallel)
     for (uint k = simd_id; k < T_kv; k += 32) {
-        // Unpack Key-Centroids für 4 Dims dieses Threads
+        // Unpack key centroids for this thread's 4 dims
         uint32_t k_packed = key_packed[kv_off_packed + k * WORDS + word_idx];
         float partial = 0.0f;
         for (uint i = 0; i < 4; i++) {
@@ -843,7 +843,7 @@ _FUSED_ATTN_NOROT_SOURCE = """
         local_max = new_max;
         local_sum = local_sum * factor + exp_s;
 
-        // Value Accumulation (im rotierten Raum)
+        // Value accumulation (in rotated space)
         uint32_t v_packed = value_packed[kv_off_packed + k * WORDS + word_idx];
         for (uint i = 0; i < 4; i++) {
             uint v_idx = (v_packed >> (bit_base + i * 2)) & 0x3u;
@@ -858,18 +858,18 @@ _FUSED_ATTN_NOROT_SOURCE = """
     threadgroup float tg_sum[32];
     threadgroup float tg_acc[32 * 128];
 
-    // Lane 0 schreibt max/sum (identisch nach simd_sum)
+    // Lane 0 writes max/sum (identical after simd_sum)
     if (lane_id == 0) {
         tg_max[simd_id] = local_max;
         tg_sum[simd_id] = local_sum;
     }
-    // Alle Lanes schreiben ihre 4 Acc-Dims
+    // All lanes write their 4 acc dims
     for (uint i = 0; i < 4; i++)
         tg_acc[simd_id * 128 + lane_id * 4 + i] = local_acc[i];
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Jede Lane berechnet 4 Output-Dimensionen durch Kombination aller Simdgroups
+    // Each lane computes 4 output dimensions by combining all simdgroups
     float global_max = -1e10f;
     for (uint s = 0; s < 32; s++)
         global_max = max(global_max, tg_max[s]);
@@ -911,12 +911,12 @@ def fused_tq_attention_norot(
     n_kv_heads: int,
     D: int,
 ) -> mx.array:
-    """High-Occupancy Fused Attention ohne Rotation (32 Simdgroups).
+    """High-occupancy fused attention without rotation (32 simdgroups).
 
-    Query muss VOR dem Call rotiert sein, Output ist im rotierten Raum.
+    Query must be rotated BEFORE the call, output is in rotated space.
 
     Args:
-        q_rot: (n_q_heads, D) float32 — skalierte, rotierte Queries
+        q_rot: (n_q_heads, D) float32 — scaled, rotated queries
         key_packed: (n_kv_heads, T_kv, D//16) uint32 — 2-bit packed
         centroids: (4,) float32
         key_norms: (n_kv_heads, T_kv) float32
@@ -924,7 +924,7 @@ def fused_tq_attention_norot(
         value_norms: (n_kv_heads, T_kv) float32
 
     Returns:
-        output_rot: (n_q_heads, D) float32 — im rotierten Raum
+        output_rot: (n_q_heads, D) float32 — in rotated space
     """
     outputs = _fused_attn_norot_kernel(
         inputs=[q_rot, key_packed, centroids, key_norms, value_packed, value_norms],

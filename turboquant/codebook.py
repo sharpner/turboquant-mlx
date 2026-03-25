@@ -1,7 +1,7 @@
-"""Lloyd-Max optimale Scalar Quantizer für die Gaussian N(0,1) Verteilung.
+"""Lloyd-Max optimal scalar quantizer for the Gaussian N(0,1) distribution.
 
-Berechnet optimale Centroids und Boundaries für b=1,2,3 Bits.
-Die Centroids minimieren den MSE unter der Normalverteilung.
+Computes optimal centroids and boundaries for b=1,2,3 bits.
+The centroids minimize MSE under the normal distribution.
 """
 
 import math
@@ -13,11 +13,11 @@ from scipy.stats import norm
 
 
 def _lloyd_max_gaussian(num_levels: int, max_iter: int = 200, tol: float = 1e-10) -> tuple[np.ndarray, np.ndarray]:
-    """Lloyd-Max Iteration für N(0,1).
+    """Lloyd-Max iteration for N(0,1).
 
-    Returns (centroids, boundaries) wobei boundaries die Entscheidungsgrenzen sind.
+    Returns (centroids, boundaries) where boundaries are the decision boundaries.
     """
-    # Initiale Boundaries: gleichmäßig verteilt über [-3, 3]
+    # Initial boundaries: uniformly distributed over [-3, 3]
     boundaries = np.linspace(-3.0, 3.0, num_levels + 1)
     boundaries[0] = -np.inf
     boundaries[-1] = np.inf
@@ -25,7 +25,7 @@ def _lloyd_max_gaussian(num_levels: int, max_iter: int = 200, tol: float = 1e-10
     centroids = np.zeros(num_levels)
 
     for _ in range(max_iter):
-        # Schritt 1: Centroids als bedingten Erwartungswert berechnen
+        # Step 1: Compute centroids as conditional expected value
         # c_i = E[X | b_{i-1} < X <= b_i]
         old_centroids = centroids.copy()
         for i in range(num_levels):
@@ -39,44 +39,44 @@ def _lloyd_max_gaussian(num_levels: int, max_iter: int = 200, tol: float = 1e-10
                 continue
             centroids[i] = numerator / denominator
 
-        # Schritt 2: Boundaries als Mittelpunkt zwischen Centroids
+        # Step 2: Boundaries as midpoint between centroids
         for i in range(1, num_levels):
             boundaries[i] = (centroids[i - 1] + centroids[i]) / 2.0
 
         if np.max(np.abs(centroids - old_centroids)) < tol:
             break
 
-    # Innere Boundaries zurückgeben (ohne -inf/+inf)
+    # Return inner boundaries (without -inf/+inf)
     inner_boundaries = boundaries[1:-1]
     return centroids, inner_boundaries
 
 
-# Precomputed Codebooks für b=1,2,3
+# Precomputed codebooks for b=1,2,3,4
 _CODEBOOKS: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _ensure_codebooks():
     if _CODEBOOKS:
         return
-    for bits in (1, 2, 3):
+    for bits in (1, 2, 3, 4):
         num_levels = 2**bits
         centroids, boundaries = _lloyd_max_gaussian(num_levels)
         _CODEBOOKS[bits] = (centroids, boundaries)
 
 
 def get_codebook(bits: int, head_dim: int) -> tuple[mx.array, mx.array]:
-    """Gibt (centroids, boundaries) zurück, skaliert mit 1/sqrt(head_dim).
+    """Returns (centroids, boundaries), scaled by 1/sqrt(head_dim).
 
     Args:
-        bits: Anzahl Bits pro Koordinate (1, 2 oder 3)
-        head_dim: Dimension des Attention-Head (z.B. 128)
+        bits: Number of bits per coordinate (1, 2, 3, or 4)
+        head_dim: Attention head dimension (e.g. 128)
 
     Returns:
-        centroids: mx.array shape (2^bits,) — die optimalen Centroid-Werte
-        boundaries: mx.array shape (2^bits - 1,) — die Entscheidungsgrenzen
+        centroids: mx.array shape (2^bits,) — the optimal centroid values
+        boundaries: mx.array shape (2^bits - 1,) — the decision boundaries
     """
-    if bits not in (1, 2, 3):
-        raise ValueError(f"Unterstützte Bits: 1, 2, 3. Erhalten: {bits}")
+    if bits not in (1, 2, 3, 4):
+        raise ValueError(f"Supported bits: 1, 2, 3, 4. Got: {bits}")
 
     _ensure_codebooks()
     centroids_np, boundaries_np = _CODEBOOKS[bits]
@@ -88,12 +88,12 @@ def get_codebook(bits: int, head_dim: int) -> tuple[mx.array, mx.array]:
 
 
 def get_codebook_unscaled(bits: int) -> tuple[mx.array, mx.array]:
-    """Gibt (centroids, boundaries) ohne Skalierung zurück.
+    """Returns (centroids, boundaries) without scaling.
 
-    Nützlich wenn die Skalierung separat erfolgt (z.B. nach Normalisierung).
+    Useful when scaling is applied separately (e.g. after normalization).
     """
     if bits not in (1, 2, 3):
-        raise ValueError(f"Unterstützte Bits: 1, 2, 3. Erhalten: {bits}")
+        raise ValueError(f"Supported bits: 1, 2, 3. Got: {bits}")
 
     _ensure_codebooks()
     centroids_np, boundaries_np = _CODEBOOKS[bits]
