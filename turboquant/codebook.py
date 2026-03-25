@@ -1,67 +1,56 @@
 """Lloyd-Max optimal scalar quantizer for the Gaussian N(0,1) distribution.
 
-Computes optimal centroids and boundaries for b=1,2,3 bits.
-The centroids minimize MSE under the normal distribution.
+Hardcoded optimal centroids and boundaries for b=1,2,3,4 bits.
+These minimize MSE under the normal distribution and are mathematical constants.
 """
 
 import math
 
 import mlx.core as mx
-import numpy as np
-from scipy.integrate import quad
-from scipy.stats import norm
 
 
-def _lloyd_max_gaussian(num_levels: int, max_iter: int = 200, tol: float = 1e-10) -> tuple[np.ndarray, np.ndarray]:
-    """Lloyd-Max iteration for N(0,1).
-
-    Returns (centroids, boundaries) where boundaries are the decision boundaries.
-    """
-    # Initial boundaries: uniformly distributed over [-3, 3]
-    boundaries = np.linspace(-3.0, 3.0, num_levels + 1)
-    boundaries[0] = -np.inf
-    boundaries[-1] = np.inf
-
-    centroids = np.zeros(num_levels)
-
-    for _ in range(max_iter):
-        # Step 1: Compute centroids as conditional expected value
-        # c_i = E[X | b_{i-1} < X <= b_i]
-        old_centroids = centroids.copy()
-        for i in range(num_levels):
-            lo, hi = boundaries[i], boundaries[i + 1]
-
-            numerator, _ = quad(lambda x: x * norm.pdf(x), lo, hi)
-            denominator, _ = quad(norm.pdf, lo, hi)
-
-            if denominator < 1e-15:
-                centroids[i] = (lo + hi) / 2.0 if np.isfinite(lo) and np.isfinite(hi) else old_centroids[i]
-                continue
-            centroids[i] = numerator / denominator
-
-        # Step 2: Boundaries as midpoint between centroids
-        for i in range(1, num_levels):
-            boundaries[i] = (centroids[i - 1] + centroids[i]) / 2.0
-
-        if np.max(np.abs(centroids - old_centroids)) < tol:
-            break
-
-    # Return inner boundaries (without -inf/+inf)
-    inner_boundaries = boundaries[1:-1]
-    return centroids, inner_boundaries
-
-
-# Precomputed codebooks for b=1,2,3,4
-_CODEBOOKS: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-
-
-def _ensure_codebooks():
-    if _CODEBOOKS:
-        return
-    for bits in (1, 2, 3, 4):
-        num_levels = 2**bits
-        centroids, boundaries = _lloyd_max_gaussian(num_levels)
-        _CODEBOOKS[bits] = (centroids, boundaries)
+# Lloyd-Max centroids and inner boundaries for N(0,1), computed via
+# iterative conditional-expectation (Lloyd's algorithm) with scipy.integrate.quad.
+# These are well-known constants — no runtime computation needed.
+_CODEBOOKS: dict[int, tuple[list[float], list[float]]] = {
+    1: (
+        [-0.7978845608028654, 0.7978845608028654],
+        [0.0],
+    ),
+    2: (
+        [-1.510417608611893, -0.4527800346911237,
+         0.4527800346911237, 1.510417608611893],
+        [-0.9815988216515084, 0.0, 0.9815988216515084],
+    ),
+    3: (
+        [-2.151945705166112, -1.3439092791423422,
+         -0.7560052816730181, -0.2450941791152904,
+         0.2450941791152904, 0.7560052816730181,
+         1.3439092791423422, 2.151945705166112],
+        [-1.7479274921542272, -1.0499572804076802,
+         -0.5005497303941542, 0.0,
+         0.5005497303941542, 1.0499572804076802,
+         1.7479274921542272],
+    ),
+    4: (
+        [-2.732896755154294, -2.069364258154187,
+         -1.618400443227723, -1.2565648452462146,
+         -0.9426291036999694, -0.6569817464411519,
+         -0.38818871416000605, -0.12844300124876415,
+         0.12844300124876415, 0.38818871416000605,
+         0.6569817464411519, 0.9426291036999694,
+         1.2565648452462146, 1.618400443227723,
+         2.069364258154187, 2.732896755154294],
+        [-2.4011305066542405, -1.8438823506909552,
+         -1.4374826442369688, -1.099596974473092,
+         -0.7998054250705606, -0.522585230300579,
+         -0.2583158577043851, 0.0,
+         0.2583158577043851, 0.522585230300579,
+         0.7998054250705606, 1.099596974473092,
+         1.4374826442369688, 1.8438823506909552,
+         2.4011305066542405],
+    ),
+}
 
 
 def get_codebook(bits: int, head_dim: int) -> tuple[mx.array, mx.array]:
@@ -78,12 +67,10 @@ def get_codebook(bits: int, head_dim: int) -> tuple[mx.array, mx.array]:
     if bits not in (1, 2, 3, 4):
         raise ValueError(f"Supported bits: 1, 2, 3, 4. Got: {bits}")
 
-    _ensure_codebooks()
-    centroids_np, boundaries_np = _CODEBOOKS[bits]
-
+    centroids_list, boundaries_list = _CODEBOOKS[bits]
     scale = 1.0 / math.sqrt(head_dim)
-    centroids = mx.array(centroids_np * scale, dtype=mx.float32)
-    boundaries = mx.array(boundaries_np * scale, dtype=mx.float32)
+    centroids = mx.array([c * scale for c in centroids_list], dtype=mx.float32)
+    boundaries = mx.array([b * scale for b in boundaries_list], dtype=mx.float32)
     return centroids, boundaries
 
 
@@ -92,9 +79,8 @@ def get_codebook_unscaled(bits: int) -> tuple[mx.array, mx.array]:
 
     Useful when scaling is applied separately (e.g. after normalization).
     """
-    if bits not in (1, 2, 3):
-        raise ValueError(f"Supported bits: 1, 2, 3. Got: {bits}")
+    if bits not in (1, 2, 3, 4):
+        raise ValueError(f"Supported bits: 1, 2, 3, 4. Got: {bits}")
 
-    _ensure_codebooks()
-    centroids_np, boundaries_np = _CODEBOOKS[bits]
-    return mx.array(centroids_np, dtype=mx.float32), mx.array(boundaries_np, dtype=mx.float32)
+    centroids_list, boundaries_list = _CODEBOOKS[bits]
+    return mx.array(centroids_list, dtype=mx.float32), mx.array(boundaries_list, dtype=mx.float32)

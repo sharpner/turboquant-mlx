@@ -10,11 +10,11 @@ This script tests:
 4. Quality comparison on actual attention patterns
 """
 
-import math
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.models.cache import make_prompt_cache
 
+from benchmark_common import compute_perplexity
 from turboquant.cache_v2 import TurboQuantKVCacheV2
 from turboquant.codebook import get_codebook_unscaled
 from turboquant.rotation import generate_rotation_matrix
@@ -35,25 +35,6 @@ EVAL_TEXT = (
     "research was founded at a workshop held on the campus of Dartmouth College during the summer "
     "of 1956."
 )
-
-
-def compute_perplexity(model, tokenizer, text, cache):
-    input_ids = mx.array(tokenizer.encode(text))[None]
-    T = input_ids.shape[1]
-    if T < 2:
-        return float("inf")
-
-    logits = model(input_ids, cache=cache)
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-
-    log_probs = shift_logits - mx.logsumexp(shift_logits, axis=-1, keepdims=True)
-    token_log_probs = mx.take_along_axis(
-        log_probs, shift_labels[:, :, None], axis=-1
-    ).squeeze(-1)
-
-    avg_nll = -mx.mean(token_log_probs).item()
-    return float(mx.exp(mx.array(avg_nll)).item())
 
 
 def analyze_quantization_error(bits, group_size, use_rotation, head_dim=128):
@@ -214,12 +195,8 @@ def main():
             cache = [TurboQuantKVCacheV2(head_dim=head_dim, bits=2, group_size=32,
                      use_rotation=False, use_normalization=False, seed=42+i) for i in range(n_layers)]
         elif strategy == "2bit_rot_gs64":
-            cache = [TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64,
+            cache = [TurboQuantKVCacheV2(head_dim=head_dim, bits=2, group_size=64,
                      use_rotation=True, use_normalization=True, seed=42+i) for i in range(n_layers)]
-            # Override to 2-bit
-            for c in cache:
-                c.bits = 2
-                c._el_per_int = 8 * mx.uint32.size // 2
         elif strategy == "2bit_rot_gs32":
             cache = [TurboQuantKVCacheV2(head_dim=head_dim, bits=2, group_size=32,
                      use_rotation=True, use_normalization=True, seed=42+i) for i in range(n_layers)]

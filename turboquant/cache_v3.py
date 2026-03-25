@@ -11,14 +11,24 @@ channel split works as well as dynamic outlier detection.
 
 Uses pure MLX operations — no custom Metal kernels, no mx.quantized_matmul.
 Pre-allocation with step=256 for minimal allocation overhead.
+
+Performance: Dequantized centroids are cached incrementally. Only newly
+added slices are dequantized — get_key_centroids() / get_value_centroids()
+return pre-computed buffers directly.
 """
 
 import mlx.core as mx
 
+from turboquant.cache import make_causal_mask
 from turboquant.codebook import get_codebook
 from turboquant.codebook_ops import quantize_to_indices, pack_2bit, pack_3bit, pack_4bit, unpack_2bit, unpack_3bit, unpack_4bit
 from turboquant.qjl import qjl_encode
-from turboquant.rotation import generate_rotation_matrix, generate_jl_matrix
+from turboquant.rotation import (
+    generate_rotation_matrix,
+    generate_jl_matrix,
+    build_combined_rot_jl,
+    safe_normalize,
+)
 
 
 def _pack(indices: mx.array, bits: int) -> mx.array:
@@ -57,7 +67,6 @@ class TurboQuantKVCacheV3:
         values at b-bit MSE.
     """
 
-    is_turboquant_v3 = True
     step = 256
 
     def __init__(
@@ -82,7 +91,6 @@ class TurboQuantKVCacheV3:
         if self.mixed:
             self.outlier_bits = outlier_bits
             self.regular_bits = bits
-            # Effective bits per dimension
             self.effective_bits = (n_outlier * outlier_bits + self.n_regular * bits) / head_dim
         else:
             self.outlier_bits = bits
@@ -98,24 +106,18 @@ class TurboQuantKVCacheV3:
 
         # --- Codebooks ---
         if self.mixed:
-            # Separate codebooks for outlier and regular channels
             self.outlier_centroids, self.outlier_boundaries = get_codebook(self.outlier_bits, head_dim)
             self.regular_centroids, self.regular_boundaries = get_codebook(self.regular_bits, head_dim)
-            self.key_outlier_centroids = self.outlier_centroids
-            self.key_outlier_boundaries = self.outlier_boundaries
             self.key_regular_centroids, self.key_regular_boundaries = get_codebook(self.key_regular_bits, head_dim)
             mx.eval(self.outlier_centroids, self.outlier_boundaries,
                     self.regular_centroids, self.regular_boundaries,
                     self.key_regular_centroids, self.key_regular_boundaries)
         else:
-            # Single codebook
             self.key_centroids, self.key_boundaries = get_codebook(
                 self.key_regular_bits if use_qjl else bits, head_dim)
             self.value_centroids, self.value_boundaries = get_codebook(bits, head_dim)
             mx.eval(self.key_centroids, self.key_boundaries,
                     self.value_centroids, self.value_boundaries)
-            # Alias for attention
-            self.centroids = self.key_centroids
 
         # --- Rotation matrix ---
         self.rotation_matrix = generate_rotation_matrix(head_dim, seed=seed)
@@ -125,20 +127,35 @@ class TurboQuantKVCacheV3:
         if use_qjl:
             self.jl_matrix = generate_jl_matrix(head_dim, seed=seed + 95)
             mx.eval(self.jl_matrix)
-            self.combined_rot_jl = mx.concatenate(
-                [self.rotation_matrix, self.jl_matrix @ self.rotation_matrix], axis=0
-            )
-            mx.eval(self.combined_rot_jl)
+            self.combined_rot_jl = build_combined_rot_jl(self.rotation_matrix, self.jl_matrix)
 
-        # --- Storage ---
+        # --- Storage (pre-allocated buffers, access via offset slicing) ---
         self.key_outlier_packed = None
         self.key_regular_packed = None
         self.key_norms = None
         self.value_outlier_packed = None
         self.value_regular_packed = None
         self.value_norms = None
-        self.key_sign_bits = None
-        self.key_residual_norms = None
+        self._key_sign_bits_buf = None
+        self._key_residual_norms_buf = None
+
+        # --- Dequantized centroid caches (P1: incremental) ---
+        self._key_centroids_cache = None
+        self._value_centroids_cache = None
+
+    @property
+    def key_sign_bits(self):
+        """Returns QJL sign bits sliced to valid offset."""
+        if self._key_sign_bits_buf is None:
+            return None
+        return self._key_sign_bits_buf[:, :, :self.offset, :]
+
+    @property
+    def key_residual_norms(self):
+        """Returns QJL residual norms sliced to valid offset."""
+        if self._key_residual_norms_buf is None:
+            return None
+        return self._key_residual_norms_buf[:, :, :self.offset]
 
     def _ensure_capacity(self, B, n_kv_heads, num_steps):
         """Pre-allocate or expand buffers."""
@@ -162,11 +179,10 @@ class TurboQuantKVCacheV3:
             return mx.zeros(shape, dtype=mx.float32)
 
         # Regular channels
-        reg_key_dim = (self.n_regular + _els_per_word(self.key_regular_bits) - 1) // _els_per_word(self.key_regular_bits) if self.n_regular > 0 else 0
-        reg_val_dim = (self.n_regular + _els_per_word(self.regular_bits) - 1) // _els_per_word(self.regular_bits) if self.n_regular > 0 else 0
-
-        if not self.mixed:
-            # Uniform mode: regular = full vector
+        if self.mixed:
+            reg_key_dim = (self.n_regular + _els_per_word(self.key_regular_bits) - 1) // _els_per_word(self.key_regular_bits) if self.n_regular > 0 else 0
+            reg_val_dim = (self.n_regular + _els_per_word(self.regular_bits) - 1) // _els_per_word(self.regular_bits) if self.n_regular > 0 else 0
+        else:
             reg_key_dim = (self.head_dim + _els_per_word(self.key_regular_bits) - 1) // _els_per_word(self.key_regular_bits)
             reg_val_dim = (self.head_dim + _els_per_word(self.regular_bits) - 1) // _els_per_word(self.regular_bits)
 
@@ -183,62 +199,90 @@ class TurboQuantKVCacheV3:
         self.key_norms = _alloc_or_grow_1d(self.key_norms, (B, n_kv_heads, new_steps))
         self.value_norms = _alloc_or_grow_1d(self.value_norms, (B, n_kv_heads, new_steps))
 
-    def _quantize_and_pack(self, rotated, is_key=True):
-        """Quantize rotated vector and pack indices."""
+        # QJL pre-allocated buffers
+        if self.use_qjl:
+            n_proj_words = self.head_dim // 32
+            if self._key_sign_bits_buf is not None:
+                sb_old = self._key_sign_bits_buf if prev % self.step == 0 else self._key_sign_bits_buf[:, :, :prev, :]
+                rn_old = self._key_residual_norms_buf if prev % self.step == 0 else self._key_residual_norms_buf[:, :, :prev]
+                self._key_sign_bits_buf = mx.concatenate([sb_old, mx.zeros((B, n_kv_heads, new_steps, n_proj_words), dtype=mx.uint32)], axis=2)
+                self._key_residual_norms_buf = mx.concatenate([rn_old, mx.zeros((B, n_kv_heads, new_steps), dtype=mx.float32)], axis=2)
+            else:
+                total_steps = new_steps
+                self._key_sign_bits_buf = mx.zeros((B, n_kv_heads, total_steps, n_proj_words), dtype=mx.uint32)
+                self._key_residual_norms_buf = mx.zeros((B, n_kv_heads, total_steps), dtype=mx.float32)
+
+        # Dequant cache buffers
+        if self._key_centroids_cache is not None:
+            kc_old = self._key_centroids_cache if prev % self.step == 0 else self._key_centroids_cache[:, :, :prev, :]
+            vc_old = self._value_centroids_cache if prev % self.step == 0 else self._value_centroids_cache[:, :, :prev, :]
+            self._key_centroids_cache = mx.concatenate([kc_old, mx.zeros((B, n_kv_heads, new_steps, self.head_dim), dtype=mx.float32)], axis=2)
+            self._value_centroids_cache = mx.concatenate([vc_old, mx.zeros((B, n_kv_heads, new_steps, self.head_dim), dtype=mx.float32)], axis=2)
+        else:
+            total_steps = new_steps
+            if self.key_regular_packed is not None:
+                total_steps = self.key_regular_packed.shape[2]
+            self._key_centroids_cache = mx.zeros((B, n_kv_heads, total_steps, self.head_dim), dtype=mx.float32)
+            self._value_centroids_cache = mx.zeros((B, n_kv_heads, total_steps, self.head_dim), dtype=mx.float32)
+
+    def _dequant_slice(self, indices_or_packed, is_key, is_outlier=False):
+        """Dequantize a slice of indices to centroid values.
+
+        Args:
+            indices_or_packed: Already-unpacked indices (uint8/uint32)
+            is_key: True for keys, False for values
+            is_outlier: True for outlier channel indices
+
+        Returns:
+            Centroid values looked up from the appropriate codebook
+        """
         if self.mixed:
-            # Split into outlier and regular channels
+            if is_key:
+                if is_outlier:
+                    return self.outlier_centroids[indices_or_packed]
+                return self.key_regular_centroids[indices_or_packed]
+            if is_outlier:
+                return self.outlier_centroids[indices_or_packed]
+            return self.regular_centroids[indices_or_packed]
+
+        if is_key:
+            return self.key_centroids[indices_or_packed]
+        return self.value_centroids[indices_or_packed]
+
+    def _quantize_and_pack(self, rotated, is_key=True):
+        """Quantize rotated vector and pack indices. Returns (out_packed, reg_packed, centroid_values)."""
+        if self.mixed:
             outlier = rotated[..., :self.n_outlier]
             regular = rotated[..., self.n_outlier:]
 
             if is_key:
-                out_idx = quantize_to_indices(outlier, self.key_outlier_boundaries)
+                out_idx = quantize_to_indices(outlier, self.outlier_boundaries)
                 reg_idx = quantize_to_indices(regular, self.key_regular_boundaries)
                 out_packed = _pack(out_idx, self.key_outlier_bits)
                 reg_packed = _pack(reg_idx, self.key_regular_bits)
+                out_vals = self.outlier_centroids[out_idx.astype(mx.uint32)]
+                reg_vals = self.key_regular_centroids[reg_idx.astype(mx.uint32)]
             else:
                 out_idx = quantize_to_indices(outlier, self.outlier_boundaries)
                 reg_idx = quantize_to_indices(regular, self.regular_boundaries)
                 out_packed = _pack(out_idx, self.outlier_bits)
                 reg_packed = _pack(reg_idx, self.regular_bits)
+                out_vals = self.outlier_centroids[out_idx.astype(mx.uint32)]
+                reg_vals = self.regular_centroids[reg_idx.astype(mx.uint32)]
 
-            return out_packed, reg_packed, (out_idx, reg_idx)
-        else:
-            if is_key:
-                idx = quantize_to_indices(rotated, self.key_boundaries)
-                packed = _pack(idx, self.key_regular_bits)
-            else:
-                idx = quantize_to_indices(rotated, self.value_boundaries)
-                packed = _pack(idx, self.regular_bits)
-            return None, packed, (None, idx)
+            centroid_vals = mx.concatenate([out_vals, reg_vals], axis=-1)
+            return out_packed, reg_packed, centroid_vals
 
-    def _unpack_and_dequant(self, is_key=True):
-        """Unpack indices and lookup centroids for full vector."""
-        T = self.offset
-        if self.mixed:
-            if is_key:
-                out_packed = self.key_outlier_packed[:, :, :T, :]
-                reg_packed = self.key_regular_packed[:, :, :T, :]
-                out_idx = _unpack(out_packed, self.n_outlier, self.key_outlier_bits)
-                reg_idx = _unpack(reg_packed, self.n_regular, self.key_regular_bits)
-                out_vals = self.key_outlier_centroids[out_idx]
-                reg_vals = self.key_regular_centroids[reg_idx]
-            else:
-                out_packed = self.value_outlier_packed[:, :, :T, :]
-                reg_packed = self.value_regular_packed[:, :, :T, :]
-                out_idx = _unpack(out_packed, self.n_outlier, self.outlier_bits)
-                reg_idx = _unpack(reg_packed, self.n_regular, self.regular_bits)
-                out_vals = self.outlier_centroids[out_idx]
-                reg_vals = self.regular_centroids[reg_idx]
-            return mx.concatenate([out_vals, reg_vals], axis=-1)
+        if is_key:
+            idx = quantize_to_indices(rotated, self.key_boundaries)
+            packed = _pack(idx, self.key_regular_bits)
+            centroid_vals = self.key_centroids[idx.astype(mx.uint32)]
         else:
-            if is_key:
-                packed = self.key_regular_packed[:, :, :T, :]
-                idx = _unpack(packed, self.head_dim, self.key_regular_bits)
-                return self.key_centroids[idx]
-            else:
-                packed = self.value_regular_packed[:, :, :T, :]
-                idx = _unpack(packed, self.head_dim, self.regular_bits)
-                return self.value_centroids[idx]
+            idx = quantize_to_indices(rotated, self.value_boundaries)
+            packed = _pack(idx, self.regular_bits)
+            centroid_vals = self.value_centroids[idx.astype(mx.uint32)]
+
+        return None, packed, centroid_vals
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Quantizes new KV pairs with Lloyd-Max codebook and stores packed."""
@@ -248,32 +292,20 @@ class TurboQuantKVCacheV3:
         self._ensure_capacity(B, n_kv_heads, num_steps)
 
         # Normalize
-        k_norms = mx.linalg.norm(keys, axis=-1, keepdims=True)
-        v_norms = mx.linalg.norm(values, axis=-1, keepdims=True)
-        safe_k = mx.where(k_norms < 1e-8, mx.ones_like(k_norms), k_norms)
-        safe_v = mx.where(v_norms < 1e-8, mx.ones_like(v_norms), v_norms)
-
-        k_normalized = keys / safe_k
-        v_normalized = values / safe_v
+        k_normalized, k_norms = safe_normalize(keys)
+        v_normalized, v_norms = safe_normalize(values)
 
         # Rotate
         k_rotated = k_normalized @ self.rotation_matrix.T
         v_rotated = v_normalized @ self.rotation_matrix.T
 
-        # Quantize and pack
-        k_out_packed, k_reg_packed, (k_out_idx, k_reg_idx) = self._quantize_and_pack(k_rotated, is_key=True)
-        v_out_packed, v_reg_packed, _ = self._quantize_and_pack(v_rotated, is_key=False)
+        # Quantize, pack, and get centroid values in one pass
+        k_out_packed, k_reg_packed, k_centroid_vals = self._quantize_and_pack(k_rotated, is_key=True)
+        v_out_packed, v_reg_packed, v_centroid_vals = self._quantize_and_pack(v_rotated, is_key=False)
 
-        # QJL on key residual (regular channels only, in rotated space)
+        # QJL on key residual
         if self.use_qjl:
-            if self.mixed:
-                # Reconstruct key vector for residual computation
-                k_out_recon = self.key_outlier_centroids[k_out_idx.astype(mx.uint32)]
-                k_reg_recon = self.key_regular_centroids[k_reg_idx.astype(mx.uint32)]
-                k_reconstructed = mx.concatenate([k_out_recon, k_reg_recon], axis=-1)
-            else:
-                k_reconstructed = self.key_centroids[k_reg_idx.astype(mx.uint32)]
-            k_residual = k_rotated - k_reconstructed
+            k_residual = k_rotated - k_centroid_vals
             k_sign_bits, k_residual_norms = qjl_encode(k_residual, self.jl_matrix)
 
         # Store
@@ -288,30 +320,25 @@ class TurboQuantKVCacheV3:
             self.value_outlier_packed[:, :, prev:self.offset, :] = v_out_packed
 
         if self.use_qjl:
-            if self.key_sign_bits is None:
-                self.key_sign_bits = k_sign_bits
-                self.key_residual_norms = k_residual_norms
-            else:
-                self.key_sign_bits = mx.concatenate([self.key_sign_bits, k_sign_bits], axis=2)
-                self.key_residual_norms = mx.concatenate([self.key_residual_norms, k_residual_norms], axis=2)
+            self._key_sign_bits_buf[:, :, prev:self.offset, :] = k_sign_bits
+            self._key_residual_norms_buf[:, :, prev:self.offset] = k_residual_norms
+
+        # Incrementally update dequant caches (P1)
+        self._key_centroids_cache[:, :, prev:self.offset, :] = k_centroid_vals
+        self._value_centroids_cache[:, :, prev:self.offset, :] = v_centroid_vals
 
         return keys, values
 
     def get_key_centroids(self) -> mx.array:
-        """Dequantize keys to centroid values."""
-        return self._unpack_and_dequant(is_key=True)
+        """Returns cached dequantized key centroids. O(1) — no re-dequantization."""
+        return self._key_centroids_cache[:, :, :self.offset, :]
 
     def get_value_centroids(self) -> mx.array:
-        """Dequantize values to centroid values."""
-        return self._unpack_and_dequant(is_key=False)
+        """Returns cached dequantized value centroids. O(1) — no re-dequantization."""
+        return self._value_centroids_cache[:, :, :self.offset, :]
 
     def make_mask(self, N, return_array=False, window_size=None, **kwargs):
-        from mlx_lm.models.base import create_causal_mask
-        if N == 1:
-            return None
-        if return_array or (window_size and N > window_size):
-            return create_causal_mask(N, offset=self.offset - N, window_size=window_size)
-        return "causal"
+        return make_causal_mask(self.offset, N, return_array, window_size)
 
     @property
     def state(self):
@@ -330,6 +357,11 @@ class TurboQuantKVCacheV3:
             ]
         if self.use_qjl and self.key_sign_bits is not None:
             parts += [self.key_sign_bits, self.key_residual_norms]
+        # Include dequant caches
+        parts += [
+            self._key_centroids_cache[:, :, :self.offset, :],
+            self._value_centroids_cache[:, :, :self.offset, :],
+        ]
         return parts
 
     @state.setter
@@ -371,8 +403,11 @@ class TurboQuantKVCacheV3:
         # Norms
         total += 2 * B * n_kv_heads * T * 4
         # QJL
-        if self.use_qjl and self.key_sign_bits is not None:
-            total += self.key_sign_bits.nbytes + self.key_residual_norms.nbytes
+        if self.use_qjl and self._key_sign_bits_buf is not None:
+            total += B * n_kv_heads * T * self._key_sign_bits_buf.shape[-1] * 4
+            total += B * n_kv_heads * T * 4
+        # NOTE: dequant caches (_key_centroids_cache, _value_centroids_cache) are
+        # a speed optimization, not compressed storage. Excluded from nbytes.
         return total
 
     @property

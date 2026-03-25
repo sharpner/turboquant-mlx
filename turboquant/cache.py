@@ -16,10 +16,9 @@ Memory layout per token (head_dim=128, mse_bits=2):
 import mlx.core as mx
 
 from turboquant.codebook import get_codebook
-from turboquant.rotation import generate_rotation_matrix, generate_jl_matrix
+from turboquant.rotation import generate_rotation_matrix, generate_jl_matrix, build_combined_rot_jl
 from turboquant.kernels import (
     turboquant_encode,
-    turboquant_decode,
     qjl_encode,
     pack_2bit_indices,
     unpack_2bit_indices,
@@ -28,15 +27,32 @@ from turboquant.kernels import (
 )
 
 
+def make_causal_mask(offset: int, N: int, return_array: bool = False, window_size=None):
+    """Creates attention mask compatible with mlx-lm.
+
+    Args:
+        offset: Current cache offset (total tokens seen)
+        N: Number of new query tokens
+        return_array: Force array mask instead of string
+        window_size: Sliding window attention size
+
+    Returns:
+        None (single token), "causal" (string), or mx.array mask
+    """
+    if N == 1:
+        return None
+    if return_array or (window_size and N > window_size):
+        from mlx_lm.models.base import create_causal_mask
+        return create_causal_mask(N, offset=offset - N, window_size=window_size)
+    return "causal"
+
+
 class TurboQuantKVCache:
     """TurboQuant KV cache with random QR rotation + QJL compression.
 
     Compatible with mlx-lm's cache interface (update_and_fetch, offset, etc.).
-    is_turboquant flag signals the patched SDPA to use custom attention.
     Indices are 2-bit packed in uint32 for maximum compression.
     """
-
-    is_turboquant = True
 
     def __init__(self, head_dim: int = 128, mse_bits: int = 2, use_qjl: bool = True, seed: int = 42):
         self.head_dim = head_dim
@@ -52,11 +68,7 @@ class TurboQuantKVCache:
         self.jl_matrix = generate_jl_matrix(head_dim, seed=seed + 95)
 
         # Precompute: Combined matrix for rotation + JL sketch in one matmul
-        # q_rot = q @ Pi^T, q_sketch = q_rot @ S^T = q @ Pi^T @ S^T = q @ (S @ Pi)^T
-        self.combined_rot_jl = mx.concatenate(
-            [self.rotation_matrix, self.jl_matrix @ self.rotation_matrix], axis=0
-        )  # (2D, D) — Pi on top, S@Pi on bottom
-        mx.eval(self.combined_rot_jl)
+        self.combined_rot_jl = build_combined_rot_jl(self.rotation_matrix, self.jl_matrix)
 
         # Quantized storage (packed) — initialized on first update_and_fetch
         self.key_packed = None      # uint32, 2-bit packed indices
@@ -156,14 +168,7 @@ class TurboQuantKVCache:
         return unpack_3bit_indices(self.value_packed, self.head_dim)
 
     def make_mask(self, N, return_array=False, window_size=None, **kwargs):
-        """Creates attention mask compatible with mlx-lm."""
-        from mlx_lm.models.base import create_causal_mask
-
-        if N == 1:
-            return None
-        if return_array or (window_size and N > window_size):
-            return create_causal_mask(N, offset=self.offset - N, window_size=window_size)
-        return "causal"
+        return make_causal_mask(self.offset, N, return_array, window_size)
 
     @property
     def state(self):

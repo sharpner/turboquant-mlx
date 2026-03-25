@@ -8,16 +8,8 @@ import math
 
 import mlx.core as mx
 
-from turboquant.kernels import fused_tq_attention_norot, unpack_2bit_indices, turboquant_decode
-
-_BITS_32 = mx.arange(32, dtype=mx.uint32)
-
-
-def _unpack_sign_bits(sign_bits: mx.array) -> mx.array:
-    expanded = (sign_bits[..., None] >> _BITS_32) & 1
-    flat_D = sign_bits.shape[-1] * 32
-    result = expanded.reshape(*sign_bits.shape[:-1], flat_D)
-    return 2.0 * result.astype(mx.float32) - 1.0
+from turboquant.kernels import fused_tq_attention_norot
+from turboquant.qjl import unpack_sign_bits
 
 
 def turboquant_fused_sdpa(
@@ -89,7 +81,7 @@ def turboquant_fused_sdpa(
 
     if cache.use_qjl:
         q_sketch_grouped = q_sketch.reshape(B, n_kv_heads, n_repeats, T_q, D)
-        k_signs_float = _unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
+        k_signs_float = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
         k_signs_expanded = k_signs_float[:, :, None, :, :]
         qjl_scores = q_sketch_grouped @ k_signs_expanded.transpose(0, 1, 2, 4, 3)
         qjl_scale = math.sqrt(math.pi / 2.0) / D

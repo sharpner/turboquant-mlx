@@ -12,147 +12,15 @@ import time
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
-from mlx_lm.models.cache import KVCache, QuantizedKVCache, make_prompt_cache
 
-from turboquant.cache import TurboQuantKVCache
-from turboquant.cache_v2 import TurboQuantKVCacheV2
-from turboquant.cache_v3 import TurboQuantKVCacheV3
+from benchmark_common import EVAL_TEXT, compute_perplexity, cache_nbytes, make_cache
 import turboquant.patch as tq_patch
 tq_patch.apply()
-
-def _cache_nbytes(cache_layer) -> int:
-    """Computes cache memory in bytes. Workaround for mlx-lm bug where
-    QuantizedKVCache.nbytes crashes due to missing tree_reduce import."""
-    # TurboQuant caches have working .nbytes
-    if hasattr(cache_layer, 'is_turboquant') or hasattr(cache_layer, 'is_turboquant_v2') or hasattr(cache_layer, 'is_turboquant_v3'):
-        return cache_layer.nbytes
-    # KVCache (fp16)
-    if isinstance(cache_layer, KVCache):
-        if cache_layer.keys is None:
-            return 0
-        return cache_layer.keys.nbytes + cache_layer.values.nbytes
-    # QuantizedKVCache — tree_reduce is broken in mlx-lm, sum manually
-    if isinstance(cache_layer, QuantizedKVCache):
-        if cache_layer.keys is None:
-            return 0
-        total = 0
-        for tensor in (*cache_layer.keys, *cache_layer.values):
-            total += tensor.nbytes
-        return total
-    return 0
 
 
 MODEL_NAME = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 PROMPT = "Write a short story about a robot learning to cook."
 MAX_TOKENS = 150
-EVAL_TEXT = (
-    "The history of artificial intelligence began in antiquity, with myths, stories and rumors of "
-    "artificial beings endowed with intelligence or consciousness by master craftsmen. The seeds of "
-    "modern AI were planted by philosophers who attempted to describe the process of human thinking "
-    "as the mechanical manipulation of symbols. This work culminated in the invention of the "
-    "programmable digital computer in the 1940s, a machine based on the abstract essence of "
-    "mathematical reasoning. This device and the ideas behind it inspired a handful of scientists "
-    "to begin seriously discussing the possibility of building an electronic brain. The field of AI "
-    "research was founded at a workshop held on the campus of Dartmouth College during the summer "
-    "of 1956. Those who attended would become the leaders of AI research for decades. Many of them "
-    "predicted that a machine as intelligent as a human being would exist in no more than a "
-    "generation, and they were given millions of dollars to make this vision come true. Eventually, "
-    "it became obvious that commercial developers and researchers had grossly underestimated the "
-    "difficulty of the project. In 1974, in response to the criticism from James Lighthill and "
-    "ongoing pressure from congress, the U.S. and British governments cut off exploratory research "
-    "in AI. The next few years would later be called an AI winter, a period when obtaining funding "
-    "for AI projects was difficult."
-)
-
-
-def make_cache(model, strategy):
-    """Creates cache based on strategy."""
-    n_layers = len(model.layers)
-    head_dim = model.layers[0].self_attn.head_dim
-
-    if strategy == "fp16":
-        return make_prompt_cache(model)
-    if strategy == "quant4":
-        return [QuantizedKVCache(group_size=64, bits=4) for _ in range(n_layers)]
-    if strategy == "quant8":
-        return [QuantizedKVCache(group_size=64, bits=8) for _ in range(n_layers)]
-    if strategy == "turboquant2":
-        return [
-            TurboQuantKVCache(head_dim=head_dim, mse_bits=2, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "turboquant3":
-        return [
-            TurboQuantKVCache(head_dim=head_dim, mse_bits=3, use_qjl=True, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "turboquant3_noqjl":
-        return [
-            TurboQuantKVCache(head_dim=head_dim, mse_bits=3, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tq_fused_2bit":
-        return [
-            TurboQuantKVCache(head_dim=head_dim, mse_bits=2, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_2bit":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=2, group_size=64, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit_norot":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, use_rotation=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit_norot":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, use_rotation=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit_lean":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, use_rotation=False, use_normalization=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit_lean":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, use_rotation=False, use_normalization=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    # --- V3: Lloyd-Max Codebook (paper-correct) ---
-    if strategy == "tqv3_2bit":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_2bit_prod":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, use_qjl=True, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_3bit":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_3bit_prod":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=True, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
@@ -182,7 +50,7 @@ def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
 
     cache_bytes = 0
     for c in cache:
-        cache_bytes += _cache_nbytes(c)
+        cache_bytes += cache_nbytes(c)
 
     return {
         "text": text,
@@ -191,28 +59,6 @@ def benchmark_generation(model, tokenizer, cache, max_tokens=MAX_TOKENS):
         "tok_per_sec": len(tokens) / elapsed if elapsed > 0 else 0,
         "cache_bytes": cache_bytes,
     }
-
-
-def compute_perplexity(model, tokenizer, text, cache):
-    """Computes perplexity on an evaluation text."""
-    input_ids = mx.array(tokenizer.encode(text))[None]  # (1, T)
-    T = input_ids.shape[1]
-
-    if T < 2:
-        return float("inf")
-
-    logits = model(input_ids, cache=cache)
-    # Shift: logits[:-1] predicts tokens[1:]
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-
-    log_probs = shift_logits - mx.logsumexp(shift_logits, axis=-1, keepdims=True)
-    token_log_probs = mx.take_along_axis(
-        log_probs, shift_labels[:, :, None], axis=-1
-    ).squeeze(-1)
-
-    avg_nll = -mx.mean(token_log_probs).item()
-    return float(mx.exp(mx.array(avg_nll)).item())
 
 
 def main():

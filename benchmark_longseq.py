@@ -13,96 +13,14 @@ import time
 import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
-from mlx_lm.models.cache import KVCache, make_prompt_cache, QuantizedKVCache
 
-from turboquant.cache_v2 import TurboQuantKVCacheV2
-from turboquant.cache_v3 import TurboQuantKVCacheV3
-
-
-def _cache_nbytes(cache_layer) -> int:
-    """Computes cache memory in bytes. Workaround for mlx-lm bug where
-    QuantizedKVCache.nbytes crashes due to missing tree_reduce import."""
-    if hasattr(cache_layer, 'is_turboquant') or hasattr(cache_layer, 'is_turboquant_v2') or hasattr(cache_layer, 'is_turboquant_v3'):
-        return cache_layer.nbytes
-    if isinstance(cache_layer, KVCache):
-        if cache_layer.keys is None:
-            return 0
-        return cache_layer.keys.nbytes + cache_layer.values.nbytes
-    if isinstance(cache_layer, QuantizedKVCache):
-        if cache_layer.keys is None:
-            return 0
-        total = 0
-        for tensor in (*cache_layer.keys, *cache_layer.values):
-            total += tensor.nbytes
-        return total
-    return 0
+from benchmark_common import cache_nbytes, make_cache
 import turboquant.patch as tq_patch
+
 tq_patch.apply()
 
 MODEL_NAME = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 GENERATE_TOKENS = 50  # Tokens to measure after prefill
-
-
-def make_cache(model, strategy):
-    n_layers = len(model.layers)
-    head_dim = model.layers[0].self_attn.head_dim
-
-    if strategy == "fp16":
-        return make_prompt_cache(model)
-    if strategy == "quant4":
-        return [QuantizedKVCache(group_size=64, bits=4) for _ in range(n_layers)]
-    if strategy == "tqv2_3bit":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit_norot":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, use_rotation=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit_norot":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, use_rotation=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_4bit_lean":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=4, group_size=64, use_qjl=False, use_rotation=False, use_normalization=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit_lean":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64, use_qjl=False, use_rotation=False, use_normalization=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv2_3bit_rot_qjl":
-        return [
-            TurboQuantKVCacheV2(head_dim=head_dim, bits=3, group_size=64,
-                use_rotation=True, use_normalization=True, use_qjl=True, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_3bit":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_3.5bit":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=3, n_outlier=head_dim // 2, outlier_bits=4, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    if strategy == "tqv3_2.5bit":
-        return [
-            TurboQuantKVCacheV3(head_dim=head_dim, bits=2, n_outlier=head_dim // 2, outlier_bits=3, use_qjl=False, seed=42 + i)
-            for i in range(n_layers)
-        ]
-    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 def build_long_prompt(tokenizer, target_tokens):
@@ -153,7 +71,7 @@ def measure_generation_speed(model, tokenizer, cache, prompt_tokens, n_generate)
 
     cache_bytes = 0
     for c in cache:
-        cache_bytes += _cache_nbytes(c)
+        cache_bytes += cache_nbytes(c)
 
     return {
         "n_tokens": len(tokens),

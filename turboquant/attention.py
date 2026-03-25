@@ -12,17 +12,7 @@ import math
 import mlx.core as mx
 
 from turboquant.kernels import unpack_2bit_indices
-
-# Bit indices for sign-bit unpacking (allocated once)
-_BITS_32 = mx.arange(32, dtype=mx.uint32)
-
-
-def _unpack_sign_bits(sign_bits: mx.array) -> mx.array:
-    """Unpacks uint32 sign bits to +/-1.0 float32."""
-    expanded = (sign_bits[..., None] >> _BITS_32) & 1
-    flat_D = sign_bits.shape[-1] * 32
-    result = expanded.reshape(*sign_bits.shape[:-1], flat_D)
-    return 2.0 * result.astype(mx.float32) - 1.0
+from turboquant.qjl import unpack_sign_bits
 
 
 def turboquant_scaled_dot_product_attention(
@@ -69,7 +59,7 @@ def turboquant_scaled_dot_product_attention(
     # --- 3. QJL-Score (optional) ---
     if cache.use_qjl:
         q_sketch_grouped = q_sketch.reshape(B, n_kv_heads, n_repeats, T_q, D)
-        k_signs_float = _unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
+        k_signs_float = unpack_sign_bits(cache.key_sign_bits[:, :, :T_kv, :])
         k_signs_expanded = k_signs_float[:, :, None, :, :]
 
         qjl_scores = q_sketch_grouped @ k_signs_expanded.transpose(0, 1, 2, 4, 3)
@@ -94,8 +84,6 @@ def turboquant_scaled_dot_product_attention(
     weights = mx.softmax(scores, axis=-1, precise=True)
 
     # --- 7. Value output via matrix associativity ---
-    # Old: output = weights @ (centroid_values @ Pi * norms)  ->  O(T_kv x D^2) decode
-    # New: output = ((weights * norms) @ centroid_values) @ Pi  ->  O(T_q x D^2) rotate
     value_indices = cache.get_value_indices()[:, :, :T_kv, :]
     value_centroids = cache.centroids[value_indices]  # (B, n_kv_heads, T_kv, D)
 

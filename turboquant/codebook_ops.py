@@ -13,10 +13,10 @@ _SHIFTS_4BIT = mx.array([i * 4 for i in range(8)], dtype=mx.uint32)
 
 
 def quantize_to_indices(values: mx.array, boundaries: mx.array) -> mx.array:
-    """Scalar quantization via boundary crossing count.
+    """Scalar quantization via cascaded boundary comparison.
 
     For each value, counts how many boundaries it exceeds.
-    Equivalent to finding the nearest centroid bin.
+    Uses accumulation loop to avoid O(N * D * num_boundaries) broadcast tensor.
 
     Args:
         values: (..., D) float32 — values to quantize
@@ -25,7 +25,13 @@ def quantize_to_indices(values: mx.array, boundaries: mx.array) -> mx.array:
     Returns:
         indices: (..., D) uint8 — centroid indices (0 to 2^bits - 1)
     """
-    return mx.sum(values[..., None] > boundaries, axis=-1).astype(mx.uint8)
+    # Accumulate boundary crossings one at a time.
+    # For 1-4 bit (1-15 boundaries), this is 1-15 comparisons
+    # without creating the huge (..., D, num_boundaries) intermediate.
+    result = mx.zeros(values.shape, dtype=mx.uint8)
+    for i in range(boundaries.size):
+        result = result + (values > boundaries[i]).astype(mx.uint8)
+    return result
 
 
 def pack_2bit(indices: mx.array) -> mx.array:
